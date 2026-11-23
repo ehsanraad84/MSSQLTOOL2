@@ -1,6 +1,6 @@
 # MSSQL Tool：SSMS 22 效率扩展
 
-[English](README.md) | [简体中文](README.zh-CN.md)
+[English](README.md) | **简体中文** | [繁體中文](README.zh-TW.md) | [日本語](README.ja.md) | [한국어](README.ko.md) | [Deutsch](README.de.md) | [Français](README.fr.md) | [Español](README.es.md)
 
 [![从 VSIX Gallery 安装](https://ssmsgallery.azurewebsites.net/badge/MSSQLTool.svg)](https://ssmsgallery.azurewebsites.net/extension/MSSQLTool/) [![Open VSIX Gallery](https://www.vsixgallery.com/badge/MSSQLTool.svg)](https://www.vsixgallery.com/extension/MSSQLTool)
 
@@ -46,7 +46,7 @@ https://github.com/PuLuShen/MSSQLTOOL/wiki
 
 ## 亮点
 
-- **完整的中英双语界面** —— 多数 SSMS 插件的界面只有英文。
+- **完整的多语言界面（8 种语言：English / 简体中文 / 繁體中文 / 日本語 / 한국어 / Deutsch / Français / Español）** —— 多数 SSMS 插件的界面只有英文。
 - **SQL Prompt 的免费替代**：SQL 智能补全、T-SQL 格式化、查询历史，以及导出到 Excel / 邮件。
 - **基于 Axial SQL Tools**（2016 年起持续维护），并增强了补全引擎与多语言层。
 

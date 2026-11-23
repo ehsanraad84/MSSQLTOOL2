@@ -6,6 +6,554 @@
 > The manual release script uses the `## <version>` section below as the GitHub release body.
 > Re-running it for the same version patches the existing release, including this text.
 
+## 5.570
+
+### 中文
+
+- **函数名不再被当作数据库名**
+  - 跨库补全的兜底推断排除了 T-SQL 内置函数与单字母标识符；`ISNULL(col, '')` 不再向服务器发起 `Database=ISNULL` 的连接并卡住按键。
+  - 真实存在的库（含单字母库、名字就叫 `ISNULL` 的库）仍按 `sys.databases` 命中，不受影响；`otherdb.dbo.MyFunc(` 这类跨库函数仍能解析到库。
+- **猜出来的库加载失败不再污染后续补全**
+  - 只有确认存在于快照中的引用库失败才写入补全快照的错误文本；仅由兜底规则猜出的名字失败只留日志，并带 `speculative=True` 标记。
+- **日志脱敏覆盖本地化异常文本**
+  - `无法打开登录所请求的数据库 "X"`、`用户 'sa' 登录失败` 现在替换为 `<database#n>`、`<user#n>`、`<server#n>`，不再把库名与登录名写入日志文件。
+  - 新增对应回归用例。
+- 回归测试 421 通过。
+
+### English
+
+- **A function name is no longer read as a database name**
+  - The cross-database fallback now rejects T-SQL built-in functions and one-letter identifiers, so `ISNULL(col, '')` no longer opens a `Database=ISNULL` connection and blocks the keystroke.
+  - Real databases (including one-letter names and a database literally named `ISNULL`) still match through `sys.databases`, and `otherdb.dbo.MyFunc(` still resolves its database.
+- **A failed guess no longer leaks into later completions**
+  - Only a referenced database that the snapshot confirms can write its connection error into the merged snapshot; a name accepted by the fallback rule alone is reported in the log only, tagged `speculative=True`.
+- **Log redaction covers localized exception text**
+  - `无法打开登录所请求的数据库 "X"` and `用户 'sa' 登录失败` now become `<database#n>`, `<user#n>` and `<server#n>` instead of writing database and login names to the log file.
+  - Covered by a new regression assertion.
+- 421 regression tests pass.
+
+## 5.569
+
+### 中文
+
+- **跨库补全：打不开的数据库不再反复超时，也不再静默缺失**
+  - 引用库（`other_db.`）连接失败后记住 10 分钟，期间不再重试，单次失败从 8–11 秒降到约 5 秒。
+  - 该类失败在日志中只留一行摘要（原来每次输出约 25 行堆栈），失败原因同时进入诊断页。
+- **整库重载不再挡住按键**
+  - 冷缓存时补全最多等待 900ms，超时先显示“加载中”，元数据就绪后自动填充弹窗，不再出现按一次键卡 6 秒却毫无反应。
+  - 加载中的占位框现在对所有上下文生效（原先只在 `dbo.` 这类成员补全时出现）。
+- **新建/变更对象更快出现在补全里**
+  - 补全结果为 0 条时，只重载当前语句点名的对象（每对象 5 秒节流），不必等整库合并。
+  - 弹窗已关闭时也会作废旧候选缓存，下一次按键立即使用新快照。
+- **候选列表由 200 条调整为 50 条**
+  - 默认 `maximumItems` 改为 50；仍是旧默认 200 的配置会一次性迁移到 50，自定义过的其他数值保持不变。
+- 回归测试 418 通过。
+
+### English
+
+- **Cross-database completion: an unopenable database no longer times out on every keystroke or disappears silently**
+  - A referenced database that cannot be opened is remembered for 10 minutes and not retried; one attempt now fails in about 5 seconds instead of 8–11.
+  - Such a failure writes a single log line (it used to dump a ~25-line stack trace), and the reason is kept for the diagnostics page.
+- **A whole-database reload no longer holds a keystroke back**
+  - A cold cache is awaited for at most 900 ms: a loading frame appears immediately and is filled in when the snapshot arrives, instead of a 6-second silent pause.
+  - The loading frame now applies to every context, not only member lists such as `dbo.`.
+- **Newly created or changed objects show up sooner**
+  - When a completion request finds nothing, only the objects named by the statement are reloaded (throttled to 5 seconds per object) instead of waiting for a whole-database merge.
+  - The cached candidate list is also discarded while the popup is closed, so the next keystroke uses the new snapshot.
+- **The candidate page is now 50 rows instead of 200**
+  - The `maximumItems` default is 50; a profile still holding the old default of 200 is migrated once, and any other chosen value is left alone.
+- 418 regression tests pass.
+
+## 5.568
+
+### 中文
+
+- **插件不再恢复查询标签页，完全交给 SSMS 自带的恢复功能**
+  - 删除整个标签页恢复功能：`QueryTabSessionService`、`QueryTabSessionStore`、会话快照文件（`QueryTabs` 目录下的 `open-tabs.json`）、`QueryTabSettings` 设置项、以及设置页的“查询标签页”页。
+  - SSMS 启动时由它自己的恢复机制处理打开的标签页，插件不再监听窗口、不写快照、不重开文档，也不会再出现“标签页被打开两次/冒出一堆临时标签页”的情况。
+  - 设置页不再有“查询标签页”选项卡；诊断页的“查询标签页”日志开关一并移除（枚举值 `LogModule.QueryTabs` 保留为保留位，保证已存的日志模块掩码不错位）。
+  - 查询文本捕获、执行历史等其他功能不受影响。
+- 回归测试 418 通过（删除标签页相关测试）。
+
+### English
+
+- **The extension no longer restores query tabs; that is left entirely to SSMS**
+  - The whole tab-restore feature is gone: `QueryTabSessionService`, `QueryTabSessionStore`, the snapshot file (`open-tabs.json` under `QueryTabs`), the `QueryTabSettings` settings and the "Query tabs" settings page.
+  - SSMS's own recovery handles the tabs on startup: the extension no longer listens to window events, writes a snapshot or reopens documents, so tabs can no longer be opened twice or appear as a crowd of temporary tabs.
+  - The "Query tabs" settings tab is removed, and so is its module switch on the diagnostics page (the `LogModule.QueryTabs` value stays reserved so stored log-module masks keep their meaning).
+  - Query text capture, execution history and the other features are unaffected.
+- 418 regression tests pass (the tab tests were removed).
+
+## 5.567
+
+### 中文
+
+- **彻底删除“改标签名称”功能**，只保留“重启后恢复未关闭的标签页”。
+  - 删除：命名规则及其占位符表、预览、序号持久化、`QueryTabNaming` / `QueryTabNamingState` 两个类、所有 caption 与 moniker 改名尝试、对话框自动化、以及相关设置项。
+  - 设置页“查询标签页”现在只有两个选项：启用恢复；异常退出后重新打开未关闭的标签页。
+  - 标签页始终使用 SSMS 自己的名称（`SQLQuery1.sql` 等），不再尝试修改、不写文件、不弹框。
+- **恢复只针对有内容的标签页**
+  - 写快照时跳过文本为空的标签页；恢复时再过滤一次空记录，重启后不会再出现空白窗口。
+  - 仍保留既有行为：跳过 SSMS 临时文件（`~vsXXXX.sql`）的记录、去重已由 SSMS 自动恢复的标签页，并把标签页文本与连接信息一起还原。
+- 回归测试 420 通过（删除了 7 项命名相关测试）。
+
+### English
+
+- **Tab renaming is removed completely**; only "reopen the query tabs that were not closed" remains.
+  - Removed: the naming rule and its placeholder table, preview, sequence persistence, the `QueryTabNaming` / `QueryTabNamingState` classes, every caption and moniker rename attempt, the dialog automation and the related settings.
+  - The "Query tabs" settings page now has two options: enable restore, and reopen tabs that were still open after an unexpected stop.
+  - Tabs always keep SSMS's own name (`SQLQuery1.sql` and so on); nothing is renamed, written or popped up.
+- **Only tabs that contain text are restored**
+  - Tabs with empty text are skipped when the snapshot is written and filtered again when it is restored, so a restart never brings back blank windows.
+  - The existing behaviour stays: records in SSMS temporary files (`~vsXXXX.sql`) are skipped, tabs SSMS restored itself are not opened twice, and the tab text and connection are restored with the tab.
+- 420 regression tests pass (the seven naming-related tests were removed).
+
+## 5.566
+
+### 中文
+
+- **修复：一个查询超时会让后面的元数据查询全部报“连接已关闭”**
+  - 日志里 `parameters` 执行超时后，`synonyms` / `sequences` / `user-defined types` / 兼容级别 连续报 `ExecuteReader 要求已打开且可用的 Connection。连接的当前状态为已关闭。`：`SqlCommand` 超时后 `SqlConnection` 会自行关闭，而后续查询仍拿着这个连接用。
+  - 现在每个元数据查询开始前都会检查连接状态，已关闭则先重新打开（`EnsureOpen`），一个慢查询不会再拖垮整份元数据。
+  - 影响面：对象/列/外键/索引/参数/同义词/序列/自定义类型/兼容级别等 15 处查询；超时本身仍会记一条错误，但其余目录能正常加载。
+- 标签命名：本版仍不弹任何对话框；日志中 `RenameDocument hr=0x80004005` 说明这台 SSMS 也拒绝静默改 moniker，标签保留默认名（待你决定后续方案）。
+
+### English
+
+- **Fix: one slow catalog query no longer makes every later one fail with "the connection is closed"**
+  - In the log, after `parameters` timed out, `synonyms` / `sequences` / `user-defined types` / compatibility level all reported `ExecuteReader requires an open and available Connection. The connection's current state is closed`: `SqlConnection` closes itself after a command timeout, and the later queries kept using it.
+  - Every catalog query now checks the connection first and reopens it when needed (`EnsureOpen`), so a single slow query cannot take the whole snapshot down.
+  - Covers the 15 object/column/foreign-key/index/parameter/synonym/sequence/type/compatibility queries; the timeout itself is still reported once, and the remaining catalogs load normally.
+- Tab naming: this build still opens no dialog; `RenameDocument hr=0x80004005` in the log shows that this SSMS also refuses a silent moniker rename, so the tab keeps its default name (awaiting your decision on the next option).
+
+## 5.565
+
+### 中文
+
+- **不再弹任何对话框**
+  - 已删除对“重命名选项卡”命令的调用及对话框自动化。日志已证实那个功能必然是模态对话框，而且命令行无法绕过。
+  - 改名改为纯静默尝试：直接调用运行文档表（RDT）的 `RenameDocument`，把文档的 moniker 改成规则名（文件仍在原来的临时目录里，不会在数据目录生成文件）。
+  - 每次改写会记一行 `RenameDocument hr=0x... current=... target=... after=...`；只有当 `after` 真的变成目标路径、且标签文字已变时才算成功。
+  - SSMS 拒绝时（hr 非 0 或路径未变），本次运行不再尝试，标签保持 SSMS 默认名，日志记 `the tab label cannot be changed silently on this build`。绝不弹框、不重开文档、不重连。
+- 新增回归保障：`MakeUniquePath` / `SamePath` 两个静默改名用到的小工具重新加入并受测。
+
+### English
+
+- **No dialog is opened any more**
+  - The call to the "Rename Tab" command and the dialog automation are gone. The log proved that feature is always a modal dialog and that the command cannot be given the new name.
+  - Renaming is now a silent attempt: the running-document table's `RenameDocument` is asked to change the document moniker to the generated name (the file stays in the temporary folder it came from, so no folder of generated files appears).
+  - Every attempt logs `RenameDocument hr=0x... current=... target=... after=...`; it only counts as applied when `after` really became the target and the tab text changed.
+  - When SSMS refuses (non-zero hr or unchanged path), the attempt is not repeated in that session, the tab keeps SSMS's own name and the log says `the tab label cannot be changed silently on this build`. No dialog, no reopened document, no reconnect.
+- The two small helpers the silent rename needs (`MakeUniquePath`, `SamePath`) are back and covered by tests.
+
+## 5.564
+
+### 中文
+
+- **修复：“重命名选项卡”命令其实弹的是模态对话框，5.563 填不上，而且会弹两次**
+  - 日志已证实：这个命令 `OtherContextMenus.DocumentWindowTab.RenameTab` 打开的是一个小对话框（输入框 + 保存/取消），并且会阻塞到对话框关闭——所以命令返回后再找编辑框，永远找不到。
+  - 现在改为：命令执行前先启动一个后台线程，在命令阻塞期间用 UI Automation 找到这个对话框，填入规则名并点“保存”；对话框关闭后命令返回，再校验标签文字。
+  - 如果 8 秒内找不到对话框或填写失败，会自动点“取消”把它关掉，并记 `the rename dialog could not be driven`；同一次运行内不再尝试，因此不会弹两次、也不会干扰使用。
+  - 标签仍保留 SSMS 默认名作为兼底，不写盘、不重开文档、不重连。
+
+### English
+
+- **Fix: the "Rename Tab" command actually opens a modal dialog, so 5.563 could not fill it and it popped up twice**
+  - The log showed the command is `OtherContextMenus.DocumentWindowTab.RenameTab`, that it opens a small dialog (editor + Save/Cancel) and that it blocks until that dialog is closed — so searching for an editor after the command returned could never succeed.
+  - A background worker now starts before the command: while the UI thread is blocked inside it, the worker finds the dialog with UI Automation, types the generated name and clicks Save. Once the dialog closes the command returns and the tab text is verified.
+  - When the dialog is not found within 8 seconds or cannot be filled, it is cancelled automatically and `the rename dialog could not be driven` is logged; no second attempt is made in the same session, so the dialog never pops up twice.
+  - The tab keeps SSMS's own label as a fallback, and nothing is written to disk, reopened or reconnected.
+
+## 5.563
+
+### 中文
+
+- **去掉“另存并重开”的做法**
+  - 不再把新查询另存为 `.sql` 文件、也不再关闭后重开文档，因此没有闪屏、不会重连服务器，也不会在数据目录里留下一堆文件。
+  - “保存新查询为文件”“保存文件夹”“关闭时删除文件”三个选项及相关代码全部移除。
+- **改名为调用 SSMS 自己的“重命名选项卡”命令**
+  - 与右键菜单里的“重命名选项卡(R)”完全同一个命令（命令名运行时自动发现），执行后直接检查标签文字是否已变成规则名。
+  - 如果该命令只是弹出内联编辑框，则只在“编辑框内容正是当前标签名”时写入新名称并回车提交，绝不碰查询编辑区；提交后同样校验。
+  - 切换标签、保存文档时，只有在标签被 SSMS 改回临时文件名时才重新应用，平时不会弹出编辑框。
+  - 若这两个途径都不生效（日志会写 `the rename editor was not found`），标签保留 SSMS 默认名，不做任何写盘或重开。
+- **修复：重启后冒出一堆 `~vsXXXX.sql` 临时标签页**
+  - 恢复时跳过路径指向 SSMS 临时文件的记录，这类标签由 SSMS 自己的自动恢复负责，不再重复打开。
+- 回归测试 426 通过（移除与另存相关的 3 项）。
+
+### English
+
+- **The save-and-reopen route is gone**
+  - A new query is no longer written to a `.sql` file and the document is no longer closed and reopened, so there is no flicker, no server reconnect and no pile of files in the data folder.
+  - The "save new queries as files", "save folder" and "delete the file on close" options and their code were removed.
+- **Renaming now uses SSMS's own "Rename Tab" command**
+  - It is the same command behind the tab context menu entry (its name is discovered at runtime), and the tab text is checked right after it runs.
+  - When the command only opens the inline editor, the new name is typed into it and committed only if the editor already shows the tab's current label, so the SQL editor is never touched; the result is verified the same way.
+  - On tab activation or document save the name is re-applied only when SSMS put its own label back, so no editor pops up during normal work.
+  - When neither route works (the log shows `the rename editor was not found`), the tab keeps the SSMS name and nothing is written or reopened.
+- **Fix: a crowd of `~vsXXXX.sql` tabs after a restart**
+  - Recovery skips records whose path is an SSMS temporary file; those tabs belong to SSMS's own AutoRecover and are no longer opened twice.
+- 426 regression tests pass (the three save-related tests were removed).
+
+## 5.562
+
+### 中文
+
+- **优先使用 SSMS 自带的“重命名选项卡”命令**
+  - 右键菜单里的“重命名选项卡(R)”背后是一个 shell 命令；本版会先调用它（名称自动发现，兼容不同版本），并校验标签页文字是否真的变成规则名。
+  - 若该命令接受名称参数，就不写任何文件、不关窗口、不重连，标签页直接改名；只有它不生效时，才回退到“另存并重开”的方式。
+  - 日志会记录 `rename-tab commands: ...` 与 `rename command '...' applied ...`，可直接看出该版本 SSMS 的命令名与结果。
+- **修复：重启后冒出一堆 `~vsXXXX.sql` 临时标签页**
+  - 原因是扩展的崩溃恢复快照也重开了 SSMS 自己用临时文件承载的查询，而这类标签本应由 SSMS 的自动恢复负责。
+  - 现在恢复时会跳过路径指向 SSMS 临时文件的记录，只恢复真正的文件标签；不再重复打开。
+- 包含 5.561 的全部内容。
+
+### English
+
+- **Use SSMS's own "Rename Tab" command first**
+  - The context-menu entry "Rename Tab" is backed by a shell command; this build calls it first (its name is discovered at runtime so shell versions do not matter) and verifies that the tab text really changed.
+  - When the command accepts the name as an argument, nothing is written to disk, no window is closed and no connection is re-established — the tab is simply renamed. The save-and-reopen route is only used when the command has no effect.
+  - The log records `rename-tab commands: ...` and `rename command '...' applied ...`, which shows the exact command and result for that SSMS build.
+- **Fix: a crowd of `~vsXXXX.sql` tabs after a restart**
+  - The crash-recovery snapshot also reopened the query documents SSMS keeps in temporary files, which its own AutoRecover is responsible for.
+  - Recovery now skips records whose path is an SSMS temporary file and restores only real file tabs, so nothing is opened twice.
+- Includes everything in 5.561.
+
+## 5.561
+
+### 中文
+
+- **修复：SSMS 接受改名调用却不改文档名，标签页仍不更新**
+  - 5.560 日志显示 `RenameDocData hr=0x00000000`（成功），但文档路径依旧是 `<temp>\~vseh4yrdwk.sql`，标签页自然不变——SSMS 的文档数据并不真的执行改名。
+  - 因此改用最后一个可行方式：另存后若文档仍未切到新文件，就关闭这个临时文档，并从已保存的文件重新打开它——标签页由 SSMS 自己按文件名渲染，不再依赖任何标题接口。
+  - 新查询此刻是空的，重开不会丢失内容；若重开失败，会自动把原临时文档重新打开，并删除刚写出的副本，标签保持原样。
+  - 整个过程有日志：`save-as kept the document...`、`RenameDocData hr=...`、`reopened the query from '...'`。
+- 包含 5.560 的全部内容。
+
+### English
+
+- **Fix: SSMS accepts the rename call but keeps the old document name**
+  - The 5.560 log showed `RenameDocData hr=0x00000000` (success) while the document stayed at `<temp>\~vseh4yrdwk.sql`, so the tab could not change — the document data does not actually rename itself.
+  - The last working route is therefore used: if the document still does not point at the saved file, the temporary document is closed and the saved file is opened again. The tab is then rendered by SSMS from the file name, with no caption API involved.
+  - A brand-new query is empty at that moment, so nothing is lost; if reopening fails, the temporary document is reopened and the copy is deleted, leaving the tab as it was.
+  - Every step is logged: `save-as kept the document...`, `RenameDocData hr=...`, `reopened the query from '...'`.
+- Includes everything in 5.560.
+
+## 5.560
+
+### 中文
+
+- **修复：另存后文档仍指向临时文件，标签页因而不改名**
+  - 5.559 的日志给出了直接证据：`TAB after save-as path='<temp>\~vsv5icgvli.sql'`，即 `Document.Save(新路径)` 只写出了文件，文档本身仍留在临时文件名上，所以标签页仍显示 `SQLQuery5.sql`。
+  - 现在另存后会检查文档当前路径；若仍与目标不一致，就调用文档数据的 `IVsPersistDocData2.RenameDocData`（SSMS 另存为时真正改名的那个接口），再次核对路径，确认文档已改为新文件后才算成功。
+  - 若重命名失败，会删除刚写出的副本，不留下多余文件，并回退到原来的标题写入尝试；日志记录 `RenameDocData hr=0x...`。
+- 包含 5.559 的全部内容（含关闭标签页删除生成的 .sql）。
+
+### English
+
+- **Fix: after Save As the document stayed on its temporary file, so the tab kept its old name**
+  - The 5.559 log showed it directly: `TAB after save-as path='<temp>\~vsv5icgvli.sql'` — `Document.Save(newPath)` wrote the file but left the document on the temporary moniker, which is why the tab still read `SQLQuery5.sql`.
+  - The save now checks the document's path; when it still differs, the document data is asked to rename itself through `IVsPersistDocData2.RenameDocData` (the interface SSMS's own Save As uses), and the path is verified before the step counts as applied.
+  - If the rename fails, the copy just written is deleted so nothing is left behind, the old caption attempts run as fallback, and the log records `RenameDocData hr=0x...`.
+- Includes everything in 5.559 (including deleting the generated .sql when a tab closes).
+
+## 5.559
+
+### 中文
+
+- **关闭查询标签页时删除自动生成的 .sql 文件**
+  - 这些文件只是为了给标签页提供名称；内容已由查询历史保存，所以关闭标签页（或正常退出 SSMS 关掉全部标签页）时会一并删除，不再堆积文件。
+  - 只删除本功能自己生成的文件：位置在当前“查询标签页”保存文件夹内的才会清理；你手动另存到其他目录的查询一律不动。
+  - 设置 → `查询标签页` 新增开关“关闭时删除生成的 .sql 文件”（默认开启）；不想删除可取消。
+  - 恢复的标签页同样处理：若它指向保存文件夹里的文件，关闭时也会清理；你自己保存的文件则保留。
+- **另存后的标签页文字做了核对**
+  - 5.558 在实际日志中显示 `applied=True via save-as`，但标签页仍显示 `SQLQuery5.sql`；本版在另存后立即记录文档真实路径与标签页实际文字：`TAB after save-as path='...' caption='...'`，用于确认 SSMS 是否真的把文档改成了新文件名。
+- 包含 5.558 的全部内容。
+
+### English
+
+- **The generated .sql file is deleted when the query tab closes**
+  - Those files exist only to give the tab a name; the query text is already kept by the query history, so closing the tab — or closing SSMS normally, which closes every tab — removes them instead of letting one file per query pile up.
+  - Only files this feature wrote are touched: the path has to be inside the current "Query tabs" folder, so a query you saved elsewhere is never deleted.
+  - Settings → `Query tabs` gains "Delete the generated .sql file when the query tab is closed" (on by default).
+  - Restored tabs follow the same rule: a file in the save folder is removed on close, a file you saved yourself is kept.
+- **The tab label is now verified right after the save**
+  - 5.558 reported `applied=True via save-as` in the field log while the tab still showed `SQLQuery5.sql`; this build records the document's real path and the tab's actual caption immediately after the save (`TAB after save-as path='...' caption='...'`) so the next log shows whether SSMS adopted the new file name.
+- Includes everything in 5.558.
+
+## 5.558
+
+### 中文
+
+- **查询标签页命名改为“另存为规则名”（SSMS 22 唯一可行的方式）**
+  - 5.557 的诊断日志已确认：`frame-caption hr=0x80020003`（`DISP_E_MEMBERNOTFOUND`），`frame-short-caption` 同样，DTE 赋值抛 `InvalidOperationException`。SSMS 22 根本没有给扩展开放“修改标签文字”的入口，标签文字就是文档的文件名（日志中 `before='SQLQuery4.sql - 珠宝厂.zbcdata (...)'` 与标签页完全一致）。
+  - 现在新建查询时按规则名称直接保存为 `.sql` 文件，SSMS 自己就会把标签页渲染为 `zbcdata - 261117 - 05.sql - 珠宝厂.zbcdata (...)`；后面的连接后缀仍由 SSMS 维护。
+  - 设置 → `查询标签页` 新增：是否启用另存、保存文件夹（留空则用数据目录下的 `Queries`，可浏览/打开），并在下方显示实际保存路径。文件名重复时自动加 ` (2)`、` (3)`，不会覆盖已有文件。
+  - 崩溃恢复同样适用：恢复的未保存标签会按记录的名称重新落盘；已有文件的标签直接重新打开，不改名、不复制。
+  - 若另存失败（目录无权限等），仍回退到原来的标题写入尝试，并在运行日志记录 `TAB save-as failed: ...`。
+- 包含 5.557 的全部内容。
+
+### English
+
+- **Query tab names are now applied by saving under the generated name — the only route SSMS 22 leaves open**
+  - The 5.557 diagnostics settled it: `frame-caption hr=0x80020003` (`DISP_E_MEMBERNOTFOUND`), the same for `frame-short-caption`, and DTE throws `InvalidOperationException`. SSMS 22 exposes no way to change a query tab's label, which is simply the document's file name (the logged `before='SQLQuery4.sql - 珠宝厂.zbcdata (...)'` matched the tab exactly).
+  - A new query is now saved as a `.sql` file named by the rule, so SSMS itself renders `zbcdata - 261117 - 05.sql - 珠宝厂.zbcdata (...)`; the connection suffix stays SSMS's own.
+  - Settings → `Query tabs` gains a switch for this, the destination folder (empty means `Queries` under the data folder, with Browse/Open) and a live line showing the folder actually used. Duplicate names get ` (2)`, ` (3)` instead of overwriting.
+  - Crash restore uses the same path: a restored unsaved tab is written under its recorded name; tabs that already have a file are reopened unchanged.
+  - If the save fails (no permission, locked file), the old caption attempts still run and the runtime log records `TAB save-as failed: ...`.
+- Includes everything in 5.557.
+
+## 5.557
+
+### 中文
+
+- **查询标签页命名：继续尝试写入标签页标题，并把过程写进运行日志**
+  - 上一次日志显示 SSMS 对 `VSFPROPID_Caption` 返回成功但实际忽略（`frame=property ignored`），DTE 赋值则抛 `InvalidOperationException`。
+  - 本版在同一个窗口框架上除 `VSFPROPID_Caption` 外再尝试 `VSFPROPID_ShortCaption`（标签式布局实际渲染的短标题）；并通过 `IVsUIShell.GetDocumentWindowEnum` 枚举所有文档窗口，按 doc data 匹配出该文档拥有的**每一个**窗口框架分别写入，以覆盖“内层编辑器框架不是渲染标签的外层框架”的情况。
+  - 诊断页的运行日志新增 `TAB` 行：每次新建查询会显示 `named '...' applied=True/False via frame-caption/frame-short-caption/dte/none`；首次被拒绝时会额外记录每个框架的 `hr`、写入前后标题原文，便于判断 SSMS 到底改写了什么。
+  - 若某个模块被关闭导致文件日志看不到内容，勾选“查询标签页”后新建一次查询，运行日志和文件日志都会出现上述 `TAB` 行。
+- 包含 5.556 的全部内容。
+
+### English
+
+- **Query tab names: one more caption route, and the whole attempt is logged**
+  - The previous log showed SSMS answering S_OK to `VSFPROPID_Caption` while keeping its own text (`frame=property ignored`), and DTE throwing `InvalidOperationException`.
+  - This build also writes `VSFPROPID_ShortCaption` (the short title a tabbed layout renders) and, through `IVsUIShell.GetDocumentWindowEnum`, applies the caption to **every** document window frame whose doc data matches the document — covering the case where the editor's inner frame is not the frame that renders the tab.
+  - The runtime log gains `TAB` lines: each new query reports `named '...' applied=True/False via frame-caption/frame-short-caption/dte/none`, and the first refusal records every frame's `hr` plus the caption before and after the write.
+  - If a module switch hides the file log, check "Query tabs" and open one query: both the runtime log and the file log now show those `TAB` lines.
+- Includes everything in 5.556.
+
+## 5.556
+
+### 中文
+
+- **诊断页新增“日志模块”开关：按模块精确记录日志**
+  - 设置 → `诊断`（Diagnostics）新增一组复选框，每个模块一个开关：自动补全、查询标签页、查询记录、执行记录、缓存加载、结果集面板、查询模板、其他常规（设置、命令、更新及未归类内容）。
+  - 取消勾选的模块**完全不写入日志文件**：既能只保留待排查模块的日志，也避免大量无关行淹没关键信息；勾选后立即生效，无需重启 SSMS。
+  - 开关随其他设置一起保存，重启后保持；`全选` / `全不选` 两个按钮可一键切换（用于“只留一个模块”的排查场景）。右侧实时显示“正在记录 N/8 个模块”。
+  - 所有开关默认勾选，升级后日志与之前完全一致；分类依据是产生日志的类（`RuntimeLog`、`CompletionTrace` 这类只转发的辅助类会向上追溯到真正的模块），因此不需要改动任何调用点。
+  - 测试模式（Test mode）的实时日志同样受这些开关控制：关闭某模块后，文件里不再出现该模块的行；已记录的实时行仍保留在页面中供复制。
+- 包含 5.555 的全部内容。
+
+### English
+
+- **Diagnostics: per-module log switches**
+  - The Diagnostics tab now has a "Log modules" group with one checkbox per module: Autocomplete, Query tabs, Query text history, Execution history, Metadata cache, Result grid, Query templates and Everything else (settings, commands, updates and anything not covered).
+  - An unchecked module writes **nothing** to the log file, so a capture can contain only the feature under investigation; a change applies immediately, no SSMS restart.
+  - The switches are stored with the other settings and survive a restart; `All modules` / `No modules` flip them in one click (for "keep one module only" sessions). A live counter shows "recording N of 8 modules".
+  - Every switch defaults to on, so an upgrade keeps the previous log byte-for-byte. Classification uses the class that produced the line; forwarding helpers such as `RuntimeLog` and `CompletionTrace` are skipped so their lines land in the real module — no call site had to change.
+  - Test mode obeys the same switches: a disabled module stops reaching the file, while lines already captured stay on the page for copying.
+- Includes everything in 5.555.
+
+## 5.555
+
+### 中文
+
+- **修复查询标签页名称仍显示 SSMS 默认名称**
+  - 原因：SSMS 的文档窗口忽略 `Window.Caption` 赋值（日志显示 `caption applied: False`），名称只写进了恢复快照。
+  - 现在改为直接设置窗口框架的 `VSFPROPID_Caption`（标签页实际渲染的属性），并在写入后回读校验；窗口创建后若被 SSMS 重置，1.2 秒后再重试一次，激活标签页时仍会重新应用。
+  - 日志会记录本次通过哪种方式生效（`frame-caption` / `dte` / `already`），若某版本 SSMS 仍拒绝，可在诊断日志中看到原因。
+- 包含 5.554 的全部内容。
+
+### English
+
+- **Fix: query tabs still showed the SSMS default name**
+  - Cause: SSMS document windows ignore the `Window.Caption` assignment (the log showed `caption applied: False`); the generated name only reached the restore snapshot.
+  - The caption is now written to the window frame's `VSFPROPID_Caption`, which is what the tab actually renders, and read back to verify. If SSMS resets it just after the window is created, one retry follows 1.2 s later, and activating the tab re-applies it.
+  - The log records which route worked (`frame-caption`, `dte` or `already`), so a build that still refuses leaves a diagnosable trace.
+- Includes everything in 5.554.
+
+## 5.554
+
+### 中文
+
+- **查询标签页命名规则更易用**
+  - 设置 → `Query tabs` 的规则输入框放大为 620×72 的多行宽框，长规则不再被截断，可换行显示。
+  - 默认规则加入年月日：`{database} - {yy}{MM}{dd} - {seq:00}`，例如 `AdventureWorks - 261117 - 01`；规则仍可自定义。
+  - 规则框下方新增占位符速查表，逐项说明含义、用法和示例：序号（含补零写法）、数据库/服务器/登录名、年月日时分秒、完整日期时间、原标签名及简写别名。
+- 包含 5.553 的全部内容。
+
+### English
+
+- **Easier query tab naming rules**
+  - The rule box in Settings → `Query tabs` is now a 620×72 multi-line field, so a long rule wraps instead of being cut off.
+  - The default rule now contains the date: `{database} - {yy}{MM}{dd} - {seq:00}`, for example `AdventureWorks - 261117 - 01`; the rule remains fully editable.
+  - A placeholder reference below the rule documents every token with its meaning, usage and an example: the running number (including zero padding), database/server/login, date and time parts, full date/time, the original tab name and the short aliases.
+- Includes everything in 5.553.
+
+## 5.553
+
+### 中文
+
+- **查询标签页命名与未关闭标签恢复**
+  - 新增查询时按规则生成标签页名称；设置 → `Query tabs` 提供总开关、恢复开关和可自定义规则（`{database}`、`{seq:00}`、`{server}`、`{login}`、`{date}`/`{time}`、`{original}` 等占位符，输入时实时预览，可一键恢复默认规则）。
+  - `{seq}` 使用的序号记录在数据目录的 `QueryTabs\naming-state.json` 中，每次取号后立即写入，因此重启 SSMS、开启多个实例或崩溃恢复后继续递增，不会从 1 重来导致重名。
+  - SSMS 运行期间持续写入标签页快照，正常退出时删除；异常退出后再次启动会自动重开这些未正常关闭的查询页（名称、文本、连接、顺序），并与 SSMS 自身的自动恢复文件去重，不会重复打开。
+- **补全元数据缓存逐项加载**
+  - 连接数据库或打开查询窗口时在后台预热一次当前连接缓存；执行更新定义的语句只按对象发送增量补丁，超过 20 个对象也改成分批补丁，不再整库重载。
+  - 后台刷新改为逐项合并发布（每批 500 个对象）：未变化对象保留原实例，补全弹窗在刷新过程中持续可用；被 DDL 影响的对象会重新读取描述、默认值、索引、约束和行数。
+- 包含 5.552 的全部内容。
+
+### English
+
+- **Query tab naming and unclosed-tab recovery**
+  - A new query tab is named from a rule. Settings → `Query tabs` has the master switch, a restore switch and an editable rule (`{database}`, `{seq:00}`, `{server}`, `{login}`, `{date}`/`{time}`, `{original}` and more), with a live preview and a one-click restore of the default rule.
+  - The number behind `{seq}` is stored in `QueryTabs\naming-state.json` in the data folder and written on every allocation, so a restart, a second SSMS instance or a crash restore continues counting instead of starting at 1 and producing duplicate names.
+  - A snapshot of the open tabs is written while SSMS runs and removed on a clean exit; after an unexpected exit the next start reopens those tabs (name, text, connection and order) and skips documents SSMS restored from AutoRecover, so nothing opens twice.
+- **Object-by-object metadata loading**
+  - Connecting to a database or opening a query window warms the cache once in the background; a statement that changes definitions sends per-object patches only, and more than 20 objects are applied as several small patches instead of a whole-database reload.
+  - A background refresh now merges object by object (500 per batch): unchanged objects keep their instance and completion stays usable during the refresh, while objects touched by DDL reload their description, defaults, indexes, constraints and row count.
+- Includes everything in 5.552.
+
+## 5.552
+
+### 中文
+
+- **诊断日志脱敏**
+  - 设置 → 诊断中的实时运行日志、诊断报告、`log_<日期>.log` 和 SQL 补全缓存状态在写入时统一脱敏：服务器/实例、数据库、登录名、密码/令牌和连接字符串不再原样记录。
+  - 同一服务器/数据库使用稳定的会话内标记（`<server#1>`、`<database#1>`）表示，多条日志仍可互相对照；已脱敏文本重复处理不会改变。
+  - 覆盖 `scope='服务器/库'`、`databases=...`、SQL 错误文本、`db.schema.object` 限定名和异常消息；版本号不会被误判为 IP 地址。
+- **结果网格分析面板**
+  - 左侧字段列表新增“全选 / 取消全选”。
+  - 筛选行改为“查找值”；列下拉支持复选框多选，移除多余输入框，并修复“应用”不生效的问题。
+  - 命中的单元格高亮显示，支持“上一处 / 下一处”跳转和匹配计数，也可使用 `F3` / `Shift+F3`。
+- 包含 5.551 的全部内容。
+
+### English
+
+- **Redacted diagnostics logs**
+  - The live runtime log, diagnostics report, `log_<date>.log` and completion cache status now mask server/instance, database, login, password/token and connection-string values at write time.
+  - Stable per-session tokens (`<server#1>`, `<database#1>`) keep lines correlatable, and already-redacted text passes through unchanged.
+  - Covers `scope='server/database'`, `databases=...`, SQL error text, `db.schema.object` names and exception messages; version numbers are not mistaken for IP addresses.
+- **Result grid analytics panel**
+  - Select all / deselect all in the field list.
+  - The filter row is now “Find value”; the column dropdown is a multi-select checkbox list, the redundant input is gone, and Apply works.
+  - Matching cells are highlighted, with Previous/Next navigation, a match counter, and `F3` / `Shift+F3`.
+- Includes everything in 5.551.
+
+## 5.551
+
+### 中文
+
+- **补全元数据缓存重写：更快、更省内存、失效不再“清空重来”**
+  - **预取**：切换/打开查询窗口时立即在后台预热当前连接的元数据（此前已有开关但从未生效），第一次补全不再等服务端。
+  - **标记失效 + 后台替换**：DDL 之后旧快照继续可用，状态栏显示“已过期，正在刷新”，新快照就绪后弹窗自动更新，不再出现“补全突然没内容”的空窗。
+  - **新鲜度可见**：补全状态文本现在同时显示对象/列数量与快照时间（HH:mm）。
+  - **按对象增量刷新**：`CREATE/ALTER/DROP TABLE|VIEW|PROC` 只重读受影响的表/视图及其一层依赖（每次最多 20 个引用），不再整库重载；`sp_rename`、架构级操作、无法确定的多段名仍走整库重载（宁慢不错）。
+  - **按签名校验代替 30 分钟过期**：用 4 条聚合查询（`sys.all_objects` / `sys.all_columns` / `sys.indexes` / `sys.check_constraints`）判断结构是否变化，默认每 5 分钟检查一次，可在设置中改为 0 关闭；只有真的变了才重载。
+  - **异步可取消加载**：打开/关闭窗口或切换连接会取消进行中的加载，同时限制并发加载数量，避免多个窗口同时抢连接。
+  - **`Definition` 懒加载**：视图/存储过程定义、描述、默认值只在需要显示详情时按语句涉及的 ≤20 个对象读取，不再在加载时全量拉取。
+  - **磁盘快照（默认关闭）**：可在设置中开启“在 SSMS 会话间保留元数据”，只保存对象名和列名（视图/存储过程定义、描述、默认值一律不落盘），单个文件上限 64 MB，冷启动直接可用；文件带键校验，拷贝到别的数据库名下会被拒绝。
+  - **内存上限**：缓存数据库数量默认 4 个（1–12 可调），超出后按最久未使用淘汰。
+  - **诊断入口**：设置页新增“显示元数据缓存状态”按钮，按数据库列出快照状态、签名是否仍有效、对象/列/参数数量、估计内存占用和磁盘种子信息。
+
+### English
+
+- **Rewritten completion metadata cache: faster, smaller, and no more “clear and reload”**
+  - **Prefetch**: opening or activating a query window warms the active connection's metadata in the background (the switch existed before but was never wired up), so the first suggestion no longer waits for the server.
+  - **Mark-dirty + background replace**: after DDL the previous snapshot stays usable, the status line reads “stale, refreshing”, and the popup updates itself when the new snapshot lands — no more empty window where completion silently had nothing.
+  - **Visible freshness**: the completion status text now shows object/column counts together with the snapshot time (HH:mm).
+  - **Per-object incremental refresh**: `CREATE/ALTER/DROP TABLE|VIEW|PROC` only re-reads the affected tables/views plus one dependency level (at most 20 references per statement) instead of reloading the database; `sp_rename`, schema-level operations and ambiguous multi-part names still fall back to a full reload.
+  - **Signature validation instead of a 30-minute expiry**: four aggregate queries (`sys.all_objects` / `sys.all_columns` / `sys.indexes` / `sys.check_constraints`) tell whether the schema moved. The check runs every 5 minutes by default, can be set to 0 to disable, and a reload only happens when something really changed.
+  - **Async, cancellable loads**: closing a window or switching connections cancels in-flight loads, and concurrent loads are capped so several windows cannot fight over connections.
+  - **Lazy `Definition`**: view/procedure definitions, descriptions and defaults are fetched only for the ≤20 objects a statement actually references, and only when the detail view needs them.
+  - **Disk seed (off by default)**: “Remember metadata between SSMS sessions” stores object and column names only — never definitions, descriptions or defaults — capped at 64 MB per file, so a cold start is instant; each file carries a key check and a snapshot copied under another database name is rejected.
+  - **Memory cap**: the cache keeps 4 databases by default (1–12), evicting the least recently used one first.
+  - **Diagnostics**: a new “Show metadata cache status” button in settings lists, per database, the snapshot state, whether its signature is still valid, object/column/parameter counts, the estimated memory footprint and disk-seed details.
+
+## 5.551
+
+### 中文
+
+- **新增：诊断页的“测试模式”开关**
+  - 设置 → **诊断** 顶部新增一个复选框（默认**不勾选**），旁边是运行日志面板：勾选后立即开始记录，并在下方**实时**逐行显示；取消勾选立即停止。状态保存在 SQL 补全设置里，重启后保持，直到手动关闭。
+  - 面板提供 **Clear / Copy log / Open log folder**（清空、复制日志、打开日志文件夹），日志同时写入扩展日志文件（行首 `TEST`），所以面板内容和 `log_<日期>.log` 能逐行对应。
+  - 记录内容尽量全面，每行带 `时:分:秒.毫秒 [级别] 类别 #线程`：
+    - `REQUEST`：触发方式（手动/自动）、光标位置、文档长度、语句范围、光标前字符、连接、元数据作用域、兼容级别、相关设置（延迟/最大条数/详情/提交键），以及“命中缓存直接复用候选”的快路径。
+    - `ANALYZE`：解析耗时，上下文类型（列表/成员/谓词…）、`prefix`、`qualifier`、目标对象、别名个数、是否抑制。
+    - `SCOPE`：跨库/链接服务器加载与同义词列解析耗时、库数、对象数。
+    - `RESULT`：候选数、过滤后可见数、对象/库总数、错误信息、整轮耗时。
+    - `METADATA`：缓存命中/未命中、各库加载耗时、对象/表/视图/同义词/序列/类型/库数量、各目录单独失败原因、磁盘种子、增量刷新与淘汰。
+    - `COMPLETE`：弹窗 show/hide 原因、过滤与焦点状态、`WM_MOUSEACTIVATE`、尺寸/位置、关闭原因（即上个版本的点击排查日志）。
+    - `SESSION`：开启测试模式时写入版本、系统、进程位数、连接/数据库与相关开关。
+  - **关闭时几乎不耗时**：所有记录点都是一次布尔判断，不构建字符串；只有真正的失败（`CompletionTrace.Failure`）在关闭时仍写入日志文件。
+- **包含 5.550 的同义词修复与 5.549 的跨库补全**。
+
+### English
+
+- **New: Test mode on the Diagnostics page**
+  - Settings → **Diagnostics** now has a checkbox (off by default) next to a runtime-log panel: checking it starts recording at once and shows the lines live below; unchecking stops it immediately. The state is stored with the SQL completion settings and survives a restart until it is switched off.
+  - The panel offers **Clear**, **Copy log** and **Open log folder**. The same lines are written to the extension log file with a `TEST` prefix, so the panel and `log_<date>.log` match line for line.
+  - Each line carries `HH:mm:ss.fff [level] category #thread` and covers:
+    - `REQUEST`: trigger (typing/explicit), caret, document length, statement range, character before the caret, connection, metadata scope, compatibility level, relevant settings, and the cached-candidate fast path.
+    - `ANALYZE`: parse time, context kind (list/member/predicate…), prefix, qualifier, target object, alias count, suppression.
+    - `SCOPE`: cross-database/linked-server loads and synonym column resolution with timings, database and object counts.
+    - `RESULT`: candidates, visible after filtering, object/database totals, errors, total round-trip time.
+    - `METADATA`: cache hits, per-database load time, object/table/view/synonym/sequence/type/database counts, per-catalog failures, disk seed, incremental refresh and eviction.
+    - `COMPLETE`: popup show/hide reasons, filter and focus state, `WM_MOUSEACTIVATE`, size/position, close reason — the click investigation from the previous version.
+    - `SESSION`: version, OS, process bitness, connection/database and the relevant switches when test mode is enabled.
+  - **Costs nothing while off**: every record point is a single boolean check and builds no strings; only real failures (`CompletionTrace.Failure`) still reach the log file when test mode is off.
+- **Includes the 5.550 synonym fix and the 5.549 cross-database completion**.
+
+## 5.550
+
+### 中文
+
+- **修复：同义词（synonym）不参与补全**
+  - JOIN 位置只列举表和视图，同义词被跳过；现在同义词和表/视图一样出现在 `FROM`、`JOIN` 的建议中，也能作为 `FROM 同义词.` 展开列（含通过别名 `FROM 同义词 s WHERE s.`）。
+  - 同义词/序列/用户定义类型以前用一条 `UNION ALL` 查询读取：任何一部分失败（例如没有 `sys.synonyms` 的权限）三项全部丢失，看起来就是“插件没加载同义词”。现在三项各自查询、各自容错，并分别记录数量。
+  - 同义词的列解析改为按语句实际引用（限定符、目标对象、所有别名值）逐个解析，单个同义词的基对象读不到只影响它自己的列，并写日志。
+  - 元数据加载完成时新增一行汇总日志：`metadata loaded scope=… objects=… tables=… views=… synonyms=… sequences=… types=… databases=… errors=…`，可直接确认同义词到底取到了几条。
+- **包含 5.549 的两项**：跨库补全（`db.` / `db.dbo.` / `JOIN db_`）修复，以及弹窗点击关闭的完整诊断日志（`COMPLETE` 前缀）。
+
+### English
+
+- **Fixed: synonyms were missing from completion**
+  - The JOIN list only enumerated tables and views, so synonyms were skipped. They are now offered in `FROM` and `JOIN`, expand their columns for `FROM synonym.` and also for an alias (`FROM synonym s WHERE s.`).
+  - Synonyms, sequences and user-defined types used to be read by one `UNION ALL` query: if any part failed (for example no permission on `sys.synonyms`) all three were lost, which looked exactly like "the plugin does not load synonyms". Each catalog is queried and handled on its own now, and the counts are logged.
+  - Synonym columns are resolved per referenced synonym (qualifier, target object and every alias value); an unreadable base object only costs that synonym's columns, and it is logged.
+  - A new summary line records the loaded snapshot: `metadata loaded scope=… objects=… tables=… views=… synonyms=… sequences=… types=… databases=… errors=…`, so the log shows how many synonyms were read.
+- **Includes both 5.549 items**: cross-database completion (`db.` / `db.dbo.` / `JOIN db_`) and the full `COMPLETE` diagnostics for the popup closing on click.
+
+## 5.549
+
+### 中文
+
+- **修复：跨库补全——`SELECT * FROM 其他库.` 不再空白**
+  - `db.` 现在同时列出该库的架构（`dbo`、`sales`）和对象（`dbo.Customers`，插入 `[dbo].[Customers]`）；`db.dbo.` 列出该库该架构的对象；`服务器.库.架构.` 同理。以前只认当前库，其他库限定符会得到一个空列表。
+  - `FROM` / `JOIN` 的源列表补上数据库、架构、链接服务器容器，输入 `db_` 就能看到 `db_production`（以前 JOIN 位置只有对象）。
+  - 其他库的元数据改为逐个库容错加载：某个库读不到（权限、离线、超时）只记日志并继续，不再让整个补全列表退化为空白；当快照里缺少 `sys.databases` 名单时，纯库名限定符仍会尝试加载该库。
+- **修复：点击补全窗口仍然会关闭（新增定位日志）**
+  - 弹窗的显示/隐藏与关闭原因、点击目标窗口、焦点/前台窗口、焦点交还结果、`WM_MOUSEACTIVATE`、缩放与移动手势、200 毫秒轮询判定，以及跨库元数据加载结果，都会以 `COMPLETE` 前缀写入扩展日志（信息级）。
+  - 复现一次点击后，把数据目录下 `MSSQLToolLog\log_<日期>.log` 发给开发者，就能定位是哪条路径关闭了窗口（设置 → 关于里能看到日志目录）。
+
+### English
+
+- **Fixed: cross-database completion — `SELECT * FROM other_db.` is no longer empty**
+  - `db.` now lists that database's schemas (`dbo`, `sales`) *and* its objects (`dbo.Customers`, inserting `[dbo].[Customers]`); `db.dbo.` lists the objects of that schema; `server.db.schema.` works the same way. Only the current database was understood before, so any other qualifier answered with an empty list.
+  - The `FROM` / `JOIN` source list now carries database, schema and linked-server containers, so typing `db_` shows `db_production` (the JOIN position used to list objects only).
+  - Another database's metadata is loaded per database with its own error handling: a database that cannot be read (permissions, offline, timeout) is logged and skipped instead of blanking the whole completion list. When the snapshot has no `sys.databases` list, a plain database qualifier is still loaded.
+- **Fixed: clicking the completion popup could still close it (diagnostics added)**
+  - Show/hide and close reasons, the clicked window, focus and foreground windows, the focus hand-back result, `WM_MOUSEACTIVATE`, resize/move gestures, the 200 ms poll decision and the cross-database metadata loads are all written to the extension log with a `COMPLETE` prefix (Information level).
+  - Reproduce the click once and send `MSSQLToolLog\log_<date>.log` from the data folder: it names the path that closed the window (Settings → About shows the log folder).
+
+## 5.548
+
+### 中文
+
+- **修复：在补全列表里点击（列表行、详情区、窗口边框）会关闭弹窗**
+  - 原因：弹窗虽然声明了 `WS_EX_NOACTIVATE`，但 WinForms 仍会把 Win32 键盘焦点交给被点击的控件（实测：焦点落到列表控件句柄上）。编辑器因此丢掉键盘焦点，外壳随之重新激活文档窗口，弹窗的 200 毫秒轮询把这次前台/焦点变化读成“已经离开编辑器”，于是关闭窗口。
+  - 现在弹窗自己处理 `WM_MOUSEACTIVATE` 并回答 `MA_NOACTIVATE`，点击不会再激活它；点击后把键盘焦点交回编辑器（优先还原点击前的窗口，SSMS 22 的 HWND-less 编辑器改用 `IVsTextView.SendExplicitFocus`），所以点完列表仍可直接继续打字。
+  - 轮询只在外来程序夺走前台、或插入符真的移动时才关闭弹窗：拖动分隔条、调整窗口大小、展开分类下拉框、点击列表期间一律保留。
+  - 单击仍然只改变选中项，双击仍然是插入；`Esc`、`Tab`/`Enter` 插入、方向键导航的行为不变。
+
+### English
+
+- **Fixed: clicking the completion popup (rows, details pane, window border) closed it**
+  - Cause: the popup declares `WS_EX_NOACTIVATE`, but WinForms still hands the Win32 keyboard focus to the clicked control (measured: the list control's handle becomes the focus window). The editor lost the keyboard, the shell re-activated the document window, and the popup's 200 ms poll read that foreground/focus change as "the editor was left" and closed the window.
+  - The window now answers `WM_MOUSEACTIVATE` with `MA_NOACTIVATE`, so a click cannot activate it, and it hands the keyboard back to the editor afterwards (the window that had focus before the click; `IVsTextView.SendExplicitFocus` for SSMS 22's HWND-less editor). Typing continues in the editor right after a click.
+  - The poll now closes the popup only when another application takes the foreground or the caret really moved: splitter drags, window resizes, an open category drop-down and clicks on the list keep it open.
+  - A single click still only selects a row and a double click still inserts; `Esc`, `Tab`/`Enter` commits and arrow-key navigation are unchanged.
+
 ## 5.547
 
 **稳定版 / Stable release**

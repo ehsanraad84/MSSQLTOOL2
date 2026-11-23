@@ -1,6 +1,6 @@
 # MSSQL Tool for SSMS 22
 
-[English](README.md) | [简体中文](README.zh-CN.md)
+**English** | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [日本語](README.ja.md) | [한국어](README.ko.md) | [Deutsch](README.de.md) | [Français](README.fr.md) | [Español](README.es.md)
 
 [![Install from VSIX Gallery](https://ssmsgallery.azurewebsites.net/badge/MSSQLTool.svg)](https://ssmsgallery.azurewebsites.net/extension/MSSQLTool/) [![Open VSIX Gallery](https://www.vsixgallery.com/badge/MSSQLTool.svg)](https://www.vsixgallery.com/extension/MSSQLTool)
 
@@ -47,7 +47,7 @@ https://github.com/PuLuShen/MSSQLTOOL/wiki
 
 ## Highlights
 
-- **Full bilingual UI (中文/English)** - most SSMS extensions are English-only.
+- **Full multilingual UI (8 languages: English, 简体中文, 繁體中文, 日本語, 한국어, Deutsch, Français, Español)** - most SSMS extensions are English-only.
 - **Free alternative to SQL Prompt** for SQL completion, T-SQL formatting, query history, and result export to Excel/email.
 - **Built on Axial SQL Tools** (maintained since 2016), with an enhanced completion engine and localization.
 
