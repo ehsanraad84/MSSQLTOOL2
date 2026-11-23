@@ -228,6 +228,10 @@
                                               Content="Trust the SQL Server certificate" Margin="0,3,12,3"
                                               ToolTip="Applies only to the background connection used to load completion metadata."/>
                                     <CheckBox x:Name="CompletionAutoRefreshMetadata" Content="Refresh metadata after schema changes" Margin="0,3,12,3"/>
+                                    <CheckBox x:Name="CompletionPrefetchMetadata" Content="Warm metadata when a query window opens" Margin="0,3,12,3"
+                                              ToolTip="Starts loading object and column names in the background, so the first suggestion does not wait for the server."/>
+                                    <CheckBox x:Name="CompletionPersistMetadata" Content="Remember metadata between SSMS sessions" Margin="0,3,12,3"
+                                              ToolTip="Stores object and column names only (no view or procedure definitions) in the extension data folder, so a cold start is instant."/>
                                     <CheckBox x:Name="CompletionShowObjectDetails" Content="Show object details" Margin="0,3,12,3"/>
                                     <CheckBox x:Name="CompletionColumnPicker" Content="Enable categorized column picker" Margin="0,3,12,3"/>
                                     <CheckBox x:Name="CompletionAutoAliases" Content="Add table aliases automatically" Margin="0,3,12,3"/>
@@ -253,6 +257,15 @@
                                     <TextBox x:Name="CompletionDelay" Width="60" Margin="8,0,0,0"/>
                                     <TextBlock Text="Maximum matches:" VerticalAlignment="Center" Margin="18,0,0,0"/>
                                     <TextBox x:Name="CompletionMaximumItems" Width="60" Margin="8,0,0,0"/>
+                                </StackPanel>
+                                <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                                    <TextBlock Text="Check for schema changes every (minutes, 0 = off):" VerticalAlignment="Center"/>
+                                    <TextBox x:Name="CompletionValidateMinutes" Width="60" Margin="8,0,0,0"/>
+                                </StackPanel>
+                                <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                                    <TextBlock Text="Cached databases:" VerticalAlignment="Center"/>
+                                    <TextBox x:Name="CompletionCacheDatabases" Width="60" Margin="8,0,0,0"
+                                             ToolTip="How many database snapshots stay in memory. The least recently used one is dropped first."/>
                                 </StackPanel>
                                 <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
                                     <TextBlock Text="Insert with:" VerticalAlignment="Center"/>
@@ -287,6 +300,10 @@
                                         Click="Button_RefreshCompletionMetadata_Click"/>
                             </Grid>
                             <TextBlock x:Name="CompletionMetadataStatus" TextWrapping="Wrap" Opacity="0.8" Margin="0,10,0,0"/>
+                            <Button Content="Show metadata cache status" HorizontalAlignment="Left" MinWidth="200" Margin="0,10,0,0"
+                                    Click="Button_ShowCompletionCacheStatus_Click"/>
+                            <TextBlock x:Name="CompletionCacheDiagnostics" TextWrapping="Wrap" Opacity="0.8" Margin="0,8,0,0"
+                                       FontFamily="Consolas" FontSize="11"/>
                         </StackPanel>
 
                         <StackPanel Grid.Row="1" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,18,0,0">
@@ -301,7 +318,8 @@
                 </ScrollViewer>
             </TabItem>
 
-            <TabItem Header="Editor">
+
+            <TabItem Header="Editor" Tag="Editor">
                 <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
                     <Grid Margin="16">
                         <Grid.ColumnDefinitions>
@@ -803,9 +821,71 @@
                     <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="0,0,0,8">
                         <Button Content="Refresh" Width="90" Click="Button_RefreshDiagnostics_Click"/>
                         <Button Content="Copy report" Width="110" Margin="8,0,0,0" Click="Button_CopyDiagnostics_Click"/>
+                        <CheckBox x:Name="TestModeCheckBox" Content="Test mode" Margin="20,0,0,0"
+                                  VerticalAlignment="Center"
+                                  ToolTip="Records runtime diagnostics — completion scope, metadata load, timing and popup decisions — and shows them live in the log below. Off by default."
+                                  Checked="TestModeCheckBox_Changed" Unchecked="TestModeCheckBox_Changed"/>
+                        <CheckBox x:Name="DetailedCompletionCheckBox" Content="Detailed autocomplete" Margin="16,0,0,0"
+                                  VerticalAlignment="Center" IsEnabled="False"
+                                  ToolTip="Records the statement context, the analyzed completion context, the caret position and the popup contents for every autocomplete request. Produces a lot of text, so it only applies while Test mode is on."
+                                  Checked="DetailedCompletionCheckBox_Changed" Unchecked="DetailedCompletionCheckBox_Changed"/>
                     </StackPanel>
-                    <TextBox x:Name="DiagnosticsText" FontFamily="Consolas" IsReadOnly="True" AcceptsReturn="True"
-                             TextWrapping="NoWrap" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"/>
+                    <Border DockPanel.Dock="Top" BorderBrush="#FFCCCCCC" BorderThickness="1" CornerRadius="3" Padding="8" Margin="0,0,0,8">
+                        <StackPanel>
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock Text="Log modules" FontWeight="Bold" VerticalAlignment="Center"/>
+                                <TextBlock Text="An unchecked module writes nothing to the log file." Margin="10,0,0,0" VerticalAlignment="Center" Opacity="0.7"/>
+                                <Button Content="All modules" Width="82" Margin="16,0,0,0" Click="Button_AllLogModules_Click"/>
+                                <Button Content="No modules" Width="86" Margin="6,0,0,0" Click="Button_NoLogModules_Click"/>
+                                <TextBlock x:Name="LogModulesStatus" Margin="12,0,0,0" VerticalAlignment="Center" Opacity="0.7"/>
+                            </StackPanel>
+                            <WrapPanel x:Name="LogModulePanel" Margin="0,6,0,0">
+                                <CheckBox x:Name="LogModuleCompletion" Content="Autocomplete" Margin="0,0,18,4"
+                                          ToolTip="Autocomplete popup, IntelliSense and the commit keys."
+                                          Checked="LogModuleCheckBox_Changed" Unchecked="LogModuleCheckBox_Changed"/>
+                                <CheckBox x:Name="LogModuleQueryTextHistory" Content="Query text history" Margin="0,0,18,4"
+                                          ToolTip="Captured query texts and their database."
+                                          Checked="LogModuleCheckBox_Changed" Unchecked="LogModuleCheckBox_Changed"/>
+                                <CheckBox x:Name="LogModuleExecutionHistory" Content="Execution history" Margin="0,0,18,4"
+                                          ToolTip="Execution history window, its records and import."
+                                          Checked="LogModuleCheckBox_Changed" Unchecked="LogModuleCheckBox_Changed"/>
+                                <CheckBox x:Name="LogModuleMetadataCache" Content="Metadata cache" Margin="0,0,18,4"
+                                          ToolTip="Metadata cache load, merge, schema refresh and warm-up."
+                                          Checked="LogModuleCheckBox_Changed" Unchecked="LogModuleCheckBox_Changed"/>
+                                <CheckBox x:Name="LogModuleResultGrid" Content="Result grid" Margin="0,0,18,4"
+                                          ToolTip="Result grid and the statistics panel."
+                                          Checked="LogModuleCheckBox_Changed" Unchecked="LogModuleCheckBox_Changed"/>
+                                <CheckBox x:Name="LogModuleQueryTemplates" Content="Query templates" Margin="0,0,18,4"
+                                          ToolTip="Query templates and snippet insertion."
+                                          Checked="LogModuleCheckBox_Changed" Unchecked="LogModuleCheckBox_Changed"/>
+                                <CheckBox x:Name="LogModuleGeneral" Content="Everything else" Margin="0,0,18,4"
+                                          ToolTip="Settings, commands, updates and anything not covered by the switches above."
+                                          Checked="LogModuleCheckBox_Changed" Unchecked="LogModuleCheckBox_Changed"/>
+                            </WrapPanel>
+                        </StackPanel>
+                    </Border>
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="*" MinHeight="70"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="2*" MinHeight="90"/>
+                        </Grid.RowDefinitions>
+                        <TextBox x:Name="DiagnosticsText" FontFamily="Consolas" IsReadOnly="True" AcceptsReturn="True"
+                                 TextWrapping="NoWrap" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"/>
+                        <GridSplitter Grid.Row="1" Height="5" HorizontalAlignment="Stretch" VerticalAlignment="Center"
+                                      ResizeBehavior="PreviousAndNext" Background="#FFCCCCCC"/>
+                        <DockPanel Grid.Row="2" Margin="0,4,0,0">
+                            <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="0,0,0,4">
+                                <TextBlock Text="Runtime log" FontWeight="Bold" VerticalAlignment="Center"/>
+                                <TextBlock x:Name="RuntimeLogStatus" Margin="10,0,0,0" VerticalAlignment="Center" Opacity="0.7"/>
+                                <Button Content="Clear" Width="70" Margin="12,0,0,0" Click="Button_ClearRuntimeLog_Click"/>
+                                <Button Content="Copy log" Width="90" Margin="8,0,0,0" Click="Button_CopyRuntimeLog_Click"/>
+                                <Button Content="Open log folder" Width="120" Margin="8,0,0,0" Click="Button_OpenRuntimeLogFolder_Click"/>
+                            </StackPanel>
+                            <TextBox x:Name="RuntimeLogText" FontFamily="Consolas" IsReadOnly="True" AcceptsReturn="True"
+                                     TextWrapping="NoWrap" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"/>
+                        </DockPanel>
+                    </Grid>
                 </DockPanel>
             </TabItem>
 

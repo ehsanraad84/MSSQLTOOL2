@@ -1530,18 +1530,100 @@ namespace MSSQLTool.Completion
                 if (scoped != null) obj = FindObject(context, metadata, scoped.ObjectName);
             }
             if (obj != null) result.AddRange(obj.Columns.Select(c => ColumnItem(c, 90, obj)));
-            else
+            else AddQualifierItems(result, context, objects, metadata, resolved);
+        }
+
+        /// <summary>
+        /// The list for a qualifier that is not an object: a database, a database and a schema, a
+        /// linked server, and so on.  A database-qualified source is written
+        /// "db.schema.object", so typing "db." offers the schemas of that database *and* its
+        /// objects (the second with the schema part already inserted), and "db.schema." offers the
+        /// objects of that schema.  Only the current database used to be understood, which is why
+        /// "SELECT * FROM other_db." suggested nothing at all.
+        /// </summary>
+        private static void AddQualifierItems(List<CompletionItem> result, CompletionContext context,
+            List<DatabaseObjectMetadata> objects, MetadataSnapshot metadata, string resolved)
+        {
+            string[] parts = CleanQualified(resolved).Split('.');
+            if (parts.Length == 1 && metadata.LinkedServerDatabases.TryGetValue(parts[0], out List<string> linkedDatabases))
             {
-                string[] parts = CleanQualified(resolved).Split('.');
-                if (parts.Length == 1 && metadata.LinkedServerDatabases.TryGetValue(parts[0], out List<string> linkedDatabases))
-                    result.AddRange(linkedDatabases.Select(d => ContainerItem(d, CompletionItemKind.Database, 100)));
-                else if (parts.Length == 2 && metadata.LinkedServers.Any(s => string.Equals(s, parts[0], StringComparison.OrdinalIgnoreCase)))
-                    result.AddRange(objects.Where(o => string.Equals(o.Server, parts[0], StringComparison.OrdinalIgnoreCase) && string.Equals(o.Database, parts[1], StringComparison.OrdinalIgnoreCase))
-                        .Select(o => o.Schema).Distinct(StringComparer.OrdinalIgnoreCase).Select(s => ContainerItem(s, CompletionItemKind.Schema, 95)));
-                else if (parts.Length == 1 && metadata.Databases.Any(d => string.Equals(d, parts[0], StringComparison.OrdinalIgnoreCase)))
-                    result.AddRange(objects.Where(o => string.Equals(o.Database, parts[0], StringComparison.OrdinalIgnoreCase)).Select(o => o.Schema)
-                        .Distinct(StringComparer.OrdinalIgnoreCase).Select(s => ContainerItem(s, CompletionItemKind.Schema, 90)));
-                else result.AddRange(objects.Where(o => EndsWith(ContainerName(o), resolved) && (!context.IsDataSourceMember || IsDataSource(o))).Select(o => ObjectItem(o, 70, true)));
+                result.AddRange(linkedDatabases.Select(d => ContainerItem(d, CompletionItemKind.Database, 100)));
+                return;
+            }
+
+            bool linkedServer = parts.Length >= 2 && metadata.LinkedServers.Any(s => string.Equals(s, parts[0], StringComparison.OrdinalIgnoreCase));
+            if (linkedServer && parts.Length == 2)
+            {
+                IEnumerable<DatabaseObjectMetadata> linkedObjects = objects.Where(o =>
+                    string.Equals(o.Server, parts[0], StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(o.Database, parts[1], StringComparison.OrdinalIgnoreCase));
+                result.AddRange(linkedObjects.Select(o => o.Schema).Distinct(StringComparer.OrdinalIgnoreCase)
+                    .Select(s => ContainerItem(s, CompletionItemKind.Schema, 95)));
+                AddSchemaObjects(result, context, linkedObjects, 70);
+                return;
+            }
+
+            bool database = parts[0].Length > 0 && metadata.Databases.Any(d => string.Equals(d, parts[0], StringComparison.OrdinalIgnoreCase));
+            if (database || linkedServer)
+            {
+                // The database part of a linked-server name is what the object carries in Database.
+                string databaseName = linkedServer ? parts[1] : parts[0];
+                string serverName = linkedServer ? parts[0] : null;
+                IEnumerable<DatabaseObjectMetadata> inDatabase = objects.Where(o =>
+                    string.Equals(o.Database, databaseName, StringComparison.OrdinalIgnoreCase)
+                    && (serverName == null || string.Equals(o.Server, serverName, StringComparison.OrdinalIgnoreCase)));
+
+                if (parts.Length == 1)
+                {
+                    // "db." — schemas first, then the objects themselves so typing the database
+                    // name already shows what is in it.
+                    result.AddRange(inDatabase.Select(o => o.Schema).Distinct(StringComparer.OrdinalIgnoreCase)
+                        .Select(s => ContainerItem(s, CompletionItemKind.Schema, 90)));
+                    AddDatabaseObjects(result, context, inDatabase, 70);
+                    return;
+                }
+
+                IEnumerable<DatabaseObjectMetadata> inSchema = inDatabase.Where(o =>
+                    string.Equals(o.Schema, parts[parts.Length - 1], StringComparison.OrdinalIgnoreCase));
+                AddSchemaObjects(result, context, inSchema, 90);
+                return;
+            }
+
+            result.AddRange(objects.Where(o => EndsWith(ContainerName(o), resolved) && (!context.IsDataSourceMember || IsDataSource(o)))
+                .Select(o => ObjectItem(o, 70, true)));
+        }
+
+        /// <summary>Objects of one schema of another database: the qualifier already carries the
+        /// database and the schema, so only the name has to be inserted.</summary>
+        private static void AddSchemaObjects(List<CompletionItem> result, CompletionContext context,
+            IEnumerable<DatabaseObjectMetadata> matches, int score)
+        {
+            foreach (DatabaseObjectMetadata item in matches)
+            {
+                if (context.IsDataSourceMember && !IsDataSource(item)) continue;
+                result.Add(ObjectItem(item, score, true));
+            }
+        }
+
+        /// <summary>Objects of a whole database: "db." still needs the schema, so the inserted text
+        /// is "[schema].[name]" and the row shows "schema.name".</summary>
+        private static void AddDatabaseObjects(List<CompletionItem> result, CompletionContext context,
+            IEnumerable<DatabaseObjectMetadata> matches, int score)
+        {
+            foreach (DatabaseObjectMetadata item in matches)
+            {
+                if (context.IsDataSourceMember && !IsDataSource(item)) continue;
+                if (string.IsNullOrWhiteSpace(item.Schema)) continue;
+                result.Add(new CompletionItem
+                {
+                    DisplayText = item.Schema + "." + item.Name,
+                    InsertText = Quote(item.Schema) + "." + Quote(item.Name),
+                    Kind = item.Kind,
+                    ObjectSource = item,
+                    OmitSchema = true,
+                    Description = item.Schema + " schema in " + item.Database,
+                    Score = score
+                });
             }
         }
 
@@ -2139,6 +2221,16 @@ namespace MSSQLTool.Completion
 
         private static IEnumerable<CompletionItem> BuildJoinItems(CompletionContext context, MetadataSnapshot metadata)
         {
+            // A source may be written as a database or a schema name ("JOIN db_production."), so the
+            // containers belong to this list as well.  They rank below the tables so they never push
+            // a real join target down; the typed prefix filters them like everything else.
+            foreach (string database in metadata.Databases)
+                yield return ContainerItem(database, CompletionItemKind.Database, 60);
+            foreach (string schema in metadata.Schemas)
+                yield return ContainerItem(schema, CompletionItemKind.Schema, 55);
+            foreach (string server in metadata.LinkedServers)
+                yield return ContainerItem(server, CompletionItemKind.Server, 50);
+
             var allSources = ScopedSources(context);
             var sources = allSources.Where(p => !string.Equals(p.Key, LastPart(p.Value), StringComparison.OrdinalIgnoreCase)).ToList();
             if (sources.Count == 0) sources = allSources;
@@ -2151,7 +2243,7 @@ namespace MSSQLTool.Completion
                 sourceNameTails.Add(LastPart(source.Value));
             MetadataObjectIndex index = metadata.GetIndex();
             bool autoAddAliases = CompletionSettings().autoAddAliases;
-            foreach (var target in metadata.Objects.Where(o => o.Kind == CompletionItemKind.Table || o.Kind == CompletionItemKind.View))
+            foreach (var target in metadata.Objects.Where(o => o.Kind == CompletionItemKind.Table || o.Kind == CompletionItemKind.View || o.Kind == CompletionItemKind.Synonym))
             {
                 if (context.IsJoinSource && !MatchesContainer(target, context.Qualifier)) continue;
                 string targetName = target.QualifiedName;

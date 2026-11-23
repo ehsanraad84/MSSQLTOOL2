@@ -1,4 +1,4 @@
-﻿using Microsoft.VisualStudio;
+using Microsoft.VisualStudio;
 using Microsoft.VisualStudio.OLE.Interop;
 using Microsoft.VisualStudio.TextManager.Interop;
 using System;
@@ -89,7 +89,7 @@ namespace MSSQLTool
             {
                 if (ShouldProcessAsteriskExpansionKey(nCmdID) && AsteriskExpansionService.TryExpand(textView))
                 {
-                    completionController.Dismiss();
+                    completionController.Dismiss("asterisk expansion");
                     return VSConstants.S_OK;
                 }
 
@@ -141,7 +141,7 @@ namespace MSSQLTool
                     || nCmdID == (uint)VSConstants.VSStd2KCmdID.LEFT
                     || nCmdID == (uint)VSConstants.VSStd2KCmdID.RIGHT)
                 {
-                    completionController.Dismiss();
+                    completionController.Dismiss("delete/left/right key");
                 }
             }
 
@@ -729,6 +729,17 @@ namespace MSSQLTool
             }
             catch { return false; }
         }
-        public void DismissCompletion() => completionController.Dismiss();
+        public void DismissCompletion()
+        {
+            // Window activation changes and clicks on other tool windows close the popup, but the
+            // popup itself is where the user is clicking: dismissing it there is what made every
+            // mouse gesture inside the list close the window.
+            if (completionController.IsSettlingPopupClick)
+            {
+                CompletionTrace.Write("shell dismissal ignored: a click inside the popup is settling");
+                return;
+            }
+            completionController.Dismiss("shell activation");
+        }
     }
 }

@@ -117,6 +117,9 @@ namespace MSSQLTool
 
         public static string LogsFolder => Path.Combine(Root, "MSSQLToolLog");
         public static string QueryHistoryFolder => Path.Combine(Root, "QueryHistory");
+
+        /// <summary>Tab names and texts of the query windows that were open when SSMS stopped.</summary>
+        public static string QueryTabsFolder => Path.Combine(Root, "QueryTabs");
         public static string GitHubProfilesFile => Path.Combine(Root, "github-sync-profiles.json");
         public static string SettingsFile => Path.Combine(Root, "settings.json");
 

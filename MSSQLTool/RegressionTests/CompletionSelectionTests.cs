@@ -21,6 +21,27 @@ namespace MSSQLTool.RegressionTests
             Run("Completion: list order is deterministic", TestCompletionOrderIsStable);
         Run("Completion: fully typed name ranks first", TestCompletionPrefersTheFullyTypedName);
             Run("Completion: typing keeps the best match selected", TestCompletionTypingKeepsBestMatch);
+            Run("Completion: a click inside the popup keeps it open", TestCompletionStaysOpenWhileClicked);
+        }
+
+        private static void TestCompletionStaysOpenWhileClicked()
+        {
+            // Another application took the foreground: the popup always closes, it must never
+            // float above a foreign window.
+            True(CompletionPresenter.ShouldDismissFromPoll(false, false, true));
+            True(CompletionPresenter.ShouldDismissFromPoll(false, true, true));
+
+            // A click inside the popup (list row, details pane, resize border) neither moves the
+            // caret nor leaves SSMS.  The poll used to dismiss it there, which closed the window
+            // under the user's pointer; it has to stay open now.
+            Equal(false, CompletionPresenter.ShouldDismissFromPoll(true, true, true));
+            Equal(false, CompletionPresenter.ShouldDismissFromPoll(true, true, false));
+
+            // Idle popup with an unchanged caret: keep it.
+            Equal(false, CompletionPresenter.ShouldDismissFromPoll(true, false, true));
+
+            // The caret really moved (arrow keys, a click in the editor, another document): close.
+            True(CompletionPresenter.ShouldDismissFromPoll(true, false, false));
         }
 
         private static void TestCompletionTypingKeepsBestMatch()

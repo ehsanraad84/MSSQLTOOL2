@@ -448,6 +448,14 @@ namespace MSSQLTool.Completion
         public string ErrorMessage { get; set; }
         public bool IsPartial { get; set; }
         public int CompatibilityLevel { get; set; } = 170;
+        /// <summary>Where the data came from: "server", "disk" (cold-start seed) or "patch" (single-object refresh).</summary>
+        public string Source { get; set; } = "server";
+        /// <summary>True while a newer snapshot is loading; the popup keeps using this one.</summary>
+        public bool IsStale { get; set; }
+        /// <summary>When this snapshot became readable (not when the catalog was queried).</summary>
+        public DateTime PublishedUtc { get; set; }
+        /// <summary>Monotonic revision, used to tell a genuinely newer snapshot from a re-published one.</summary>
+        public int Revision { get; set; }
         public List<string> Schemas { get; } = new List<string>();
         public List<string> Databases { get; } = new List<string>();
         public List<string> LinkedServers { get; } = new List<string>();
@@ -508,11 +516,22 @@ namespace MSSQLTool.Completion
             // must be rebuilt to pick up the enriched list.
             index = null;
         }
-        public string StatusText => !string.IsNullOrWhiteSpace(ErrorMessage)
-            ? (IsPartial
-                ? LocalizationManager.T("metadata partially loaded")
-                : LocalizationManager.T("metadata unavailable"))
-            : LocalizationManager.Format("metadata {0} objects / {1} columns", Objects.Count, Objects.Sum(o => o.Columns.Count));
+        public string StatusText
+        {
+            get
+            {
+                if (!string.IsNullOrWhiteSpace(ErrorMessage))
+                    return IsPartial
+                        ? LocalizationManager.T("metadata partially loaded")
+                        : LocalizationManager.T("metadata unavailable");
+
+                string text = LocalizationManager.Format("metadata {0} objects / {1} columns",
+                    Objects.Count, Objects.Sum(o => o.Columns.Count));
+                if (IsStale) text += " · " + LocalizationManager.T("stale, refreshing");
+                if (LoadedUtc != default(DateTime)) text += " · " + LoadedUtc.ToLocalTime().ToString("HH:mm");
+                return text;
+            }
+        }
 
         // Built lazily on first completion request after load; the object and
         // foreign-key lists are stable afterwards, so one index serves every

@@ -1,4 +1,4 @@
-﻿using Microsoft.Data.SqlClient;
+using Microsoft.Data.SqlClient;
 using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
@@ -9,253 +9,54 @@ using System.Linq;
 
 namespace MSSQLTool.Completion
 {
-    internal static class SqlMetadataCache
+    internal static partial class SqlMetadataCache
     {
-        private sealed class Entry
-        {
-            public DateTime CreatedUtc;
-            public Lazy<Task<MetadataSnapshot>> Work;
-            public Task<MetadataSnapshot> Task => Work.Value;
-        }
-        private static readonly ConcurrentDictionary<string, Entry> Cache = new ConcurrentDictionary<string, Entry>(StringComparer.OrdinalIgnoreCase);
-        // Snapshot lifetime is a background freshness safety net only, not a
-        // user-visible reload: once expired, callers keep getting the stale
-        // snapshot immediately while a replacement loads in the background
-        // (stale-while-revalidate). SQL Prompt follows the same model — its
-        // cache stays resident for the whole session and is refreshed by DDL
-        // detection or an explicit user refresh, never by blocking reloads.
-        // Schema changes executed from this plugin invalidate the entry
-        // immediately (Invalidate), so the timer only covers external changes.
-        private static readonly TimeSpan Lifetime = TimeSpan.FromMinutes(30);
-
-        public static Task<MetadataSnapshot> GetAsync(ScriptFactoryAccess.ConnectionInfo info, CancellationToken token)
-        {
-            if (info == null || string.IsNullOrWhiteSpace(info.FullConnectionString)) return Task.FromResult(MetadataSnapshot.Empty);
-            string key = GetKey(info.FullConnectionString);
-            Entry entry = GetOrCreate(key, () => Load(info),
-                LocalizationManager.T("Loading SQL completion metadata..."));
-            return AwaitWithCancellation(entry.Task, token);
-        }
-
-        public static Task<MetadataSnapshot> GetDatabaseAsync(ScriptFactoryAccess.ConnectionInfo info, string database, CancellationToken token)
-        {
-            if (info == null || string.IsNullOrWhiteSpace(info.FullConnectionString) || string.IsNullOrWhiteSpace(database)) return Task.FromResult(MetadataSnapshot.Empty);
-            string key = GetKey(info.FullConnectionString, database);
-            Entry entry = GetOrCreate(key, () => Load(info, database),
-                LocalizationManager.Format("Loading SQL completion metadata for database {0}...", database));
-            return AwaitWithCancellation(entry.Task, token);
-        }
-
-        public static Task<MetadataSnapshot> GetLinkedServerAsync(ScriptFactoryAccess.ConnectionInfo info, string linkedServer, string database, CancellationToken token)
-        {
-            if (info == null || string.IsNullOrWhiteSpace(info.FullConnectionString)) return Task.FromResult(MetadataSnapshot.Empty);
-            string key = GetKey(info.FullConnectionString) + "|linked|" + linkedServer + "|" + (database ?? string.Empty);
-            Entry entry = GetOrCreate(key, () => LoadLinked(info, linkedServer, database),
-                LocalizationManager.Format("Loading SQL completion metadata from linked server {0}...", linkedServer));
-            return AwaitWithCancellation(entry.Task, token);
-        }
-
-        /// <summary>
-        /// Warms the cache for a connection in the background, without the
-        /// status bar animation. Used when the active connection changes so the
-        /// first completion request does not pay the schema-load latency.
-        /// </summary>
-        public static Task PrefetchAsync(ScriptFactoryAccess.ConnectionInfo info)
-        {
-            if (info == null || string.IsNullOrWhiteSpace(info.FullConnectionString)) return Task.CompletedTask;
-            Entry entry = GetOrCreate(GetKey(info.FullConnectionString), () => Load(info), null);
-            return entry.Task;
-        }
-
-        private static Entry GetOrCreate(string key, Func<MetadataSnapshot> loader, string statusMessage)
-        {
-            var replacement = new Entry
-            {
-                CreatedUtc = DateTime.UtcNow,
-                Work = new Lazy<Task<MetadataSnapshot>>(
-                    () => LoadWithFeedbackAsync(loader, statusMessage),
-                    LazyThreadSafetyMode.ExecutionAndPublication)
-            };
-
-            Entry current = Cache.GetOrAdd(key, replacement);
-            if (IsFresh(current))
-            {
-                // Sliding expiration: as long as the snapshot keeps being used
-                // (e.g. every newly opened query window), its lifetime is
-                // renewed so an active connection is refreshed in the
-                // background only, never synchronously per window.
-                current.CreatedUtc = DateTime.UtcNow;
-                return current;
-            }
-
-            if (current.Work.IsValueCreated && current.Task.IsCompleted)
-            {
-                // Completed snapshot (even one with errors): hand it out
-                // right away and refresh in the background so completions
-                // never block on a reload after the lifetime elapsed.
-                if (Cache.TryUpdate(key, replacement, current))
-                {
-                    StartBackgroundRefresh(replacement);
-                    return current;
-                }
-                return Cache.GetOrAdd(key, replacement);
-            }
-
-            // Not started yet, or faulted/canceled: (re)start and wait.
-            if (Cache.TryUpdate(key, replacement, current))
-                return replacement;
-            return Cache.GetOrAdd(key, replacement);
-        }
-
-        private static async void StartBackgroundRefresh(Entry entry)
-        {
-            try
-            {
-                await entry.Task.ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                MSSQLToolPackage._logger?.Error(ex, "Background SQL completion metadata refresh failed");
-            }
-        }
-
-        private static async Task<MetadataSnapshot> LoadWithFeedbackAsync(Func<MetadataSnapshot> loader, string statusMessage)
-        {
-            // statusMessage == null marks a background prefetch: no status bar
-            // animation, the load simply warms the cache for the next request.
-            if (string.IsNullOrEmpty(statusMessage))
-                return await Task.Run(loader, CancellationToken.None).ConfigureAwait(false);
-
-            using (StatusFeedback.Begin(statusMessage))
-            {
-                LoadProgress.Reset(statusMessage);
-                return await Task.Run(loader, CancellationToken.None).ConfigureAwait(false);
-            }
-        }
-
-        /// <summary>
-        /// Progress of the metadata load that is currently running: which step it is on, how much it has
-        /// read, and how long it has been going.  The status bar and the completion popup both read it,
-        /// so a slow server no longer looks like a frozen popup.
-        /// </summary>
-        internal static class LoadProgress
-        {
-            private static readonly Stopwatch Clock = new Stopwatch();
-            private static string message = string.Empty;
-            private static string step = string.Empty;
-            private static int items;
-
-            internal static string Current => Volatile.Read(ref message);
-
-            internal static void Reset(string statusMessage)
-            {
-                Clock.Restart();
-                Volatile.Write(ref step, statusMessage ?? string.Empty);
-                Volatile.Write(ref items, 0);
-                Volatile.Write(ref message, statusMessage ?? string.Empty);
-            }
-
-            internal static void Step(string stepName, int count = 0)
-            {
-                if (string.IsNullOrWhiteSpace(stepName)) return;
-                Volatile.Write(ref step, stepName);
-                Volatile.Write(ref items, count);
-                Publish();
-            }
-
-            /// <summary>Called while a reader is streaming, to keep the count (and the clock) moving.</summary>
-            internal static void Report(string stepName, int count)
-            {
-                Volatile.Write(ref step, stepName);
-                Volatile.Write(ref items, count);
-                Publish();
-            }
-
-            private static void Publish()
-            {
-                string text = LocalizationManager.Format("{0} ({1}: {2}, {3:0.0}s)", LocalizationManager.T("Loading SQL completion metadata"),
-                    Volatile.Read(ref step), Volatile.Read(ref items), Clock.Elapsed.TotalSeconds);
-                Volatile.Write(ref message, text);
-                StatusFeedback.Update(text);
-            }
-        }
-
-        private static bool IsFresh(Entry entry)
-        {
-            TimeSpan age = DateTime.UtcNow - entry.CreatedUtc;
-            if (age >= Lifetime) return false;
-            if (!entry.Work.IsValueCreated) return true;
-            Task<MetadataSnapshot> task = entry.Task;
-            if (task.IsFaulted || task.IsCanceled) return age < TimeSpan.FromSeconds(15);
-            if (task.IsCompleted && !string.IsNullOrWhiteSpace(task.Result?.ErrorMessage)) return age < TimeSpan.FromSeconds(30);
-            return true;
-        }
-
-        public static void Invalidate(ScriptFactoryAccess.ConnectionInfo info)
-        {
-            if (info == null || string.IsNullOrWhiteSpace(info.FullConnectionString)) return;
-            var builder = new SqlConnectionStringBuilder(info.FullConnectionString);
-            string prefix = builder.DataSource + "|";
-            foreach (string key in Cache.Keys)
-                if (key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-                    Cache.TryRemove(key, out Entry _);
-            RaiseInvalidated();
-        }
-
-        public static void InvalidateAll() => Cache.Clear();
-
-        /// <summary>Raised after cache entries were dropped so dependent caches (e.g. merged cross-database snapshots) can be discarded.</summary>
-        internal static event Action Invalidated;
-
-        private static void RaiseInvalidated()
-        {
-            Action handlers = Invalidated;
-            if (handlers != null) handlers();
-        }
-
-        internal static bool ShouldInvalidateAfterExecution(string sql)
-        {
-            string executableSql = SqlTextContext.MaskCommentsAndStrings(sql ?? string.Empty);
-            return System.Text.RegularExpressions.Regex.IsMatch(executableSql,
-                       @"\b(?:CREATE|ALTER|DROP|RENAME|TRUNCATE)\s+(?:TABLE|VIEW|PROCEDURE|PROC|FUNCTION|SYNONYM|TYPE|SCHEMA)\b",
-                       System.Text.RegularExpressions.RegexOptions.IgnoreCase)
-                   || System.Text.RegularExpressions.Regex.IsMatch(executableSql, @"\bsp_rename\b",
-                       System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-        }
-
-        public static bool TryGetCached(ScriptFactoryAccess.ConnectionInfo info, out MetadataSnapshot snapshot)
-        {
-            snapshot = null;
-            if (info == null || string.IsNullOrWhiteSpace(info.FullConnectionString)) return false;
-            if (!Cache.TryGetValue(GetKey(info.FullConnectionString), out Entry entry) || !entry.Work.IsValueCreated) return false;
-            Task<MetadataSnapshot> task = entry.Task;
-            if (!task.IsCompleted || task.IsCanceled || task.IsFaulted) return false;
-            snapshot = task.Result;
-            return snapshot != null;
-        }
-
-        public static async Task<MetadataSnapshot> RefreshAsync(ScriptFactoryAccess.ConnectionInfo info, CancellationToken token)
-        {
-            if (info == null || string.IsNullOrWhiteSpace(info.FullConnectionString)) return MetadataSnapshot.Empty;
-            Invalidate(info);
-            string key = GetKey(info.FullConnectionString);
-            Entry entry = GetOrCreate(key, () => Load(info),
-                LocalizationManager.T("Refreshing SQL completion metadata..."));
-            return await AwaitWithCancellation(entry.Task, token).ConfigureAwait(false);
-        }
+        // Cache state, the loading pipeline, freshness checks, incremental refresh, the optional
+        // disk seed and the diagnostics live in SqlMetadataCache.Store.cs.  This file keeps the
+        // catalog queries and the cache-key rules.
 
         public static async Task ResolveSynonymColumnsAsync(ScriptFactoryAccess.ConnectionInfo info, MetadataSnapshot snapshot, CompletionContext context, CancellationToken token)
         {
             if (info == null || snapshot == null || context == null) return;
-            string requested = (context.Qualifier ?? context.TargetObject ?? string.Empty).Replace("[", "").Replace("]", "");
-            DatabaseObjectMetadata synonym = snapshot.Objects.FirstOrDefault(o => o.Kind == CompletionItemKind.Synonym && o.Columns.Count == 0
-                && !string.IsNullOrWhiteSpace(o.SynonymBaseObjectName)
-                && (string.Equals(o.Name, requested, StringComparison.OrdinalIgnoreCase) || requested.EndsWith("." + o.Name, StringComparison.OrdinalIgnoreCase)));
-            if (synonym == null) return;
-            var columns = await Task.Run(() => DescribeSynonym(info, synonym.SynonymBaseObjectName, token), token).ConfigureAwait(false);
-            lock (synonym.Columns)
-                if (synonym.Columns.Count == 0) synonym.Columns.AddRange(columns);
+            // The synonym may be written as "syn.", "dbo.syn." or reached through an alias ("FROM syn s
+            // WHERE s."), so every name the statement uses for it counts: the qualifier, the target
+            // object and every alias value (which is the object the alias stands for).
+            var requested = new List<string>();
+            foreach (string value in new[] { context.Qualifier, context.TargetObject })
+                if (!string.IsNullOrWhiteSpace(value)) requested.Add(CleanName(value));
+            foreach (string value in context.Aliases.Values)
+                if (!string.IsNullOrWhiteSpace(value)) requested.Add(CleanName(value));
+            if (requested.Count == 0) return;
+
+            List<DatabaseObjectMetadata> pending = snapshot.Objects
+                .Where(o => o.Kind == CompletionItemKind.Synonym && o.Columns.Count == 0 && !string.IsNullOrWhiteSpace(o.SynonymBaseObjectName)
+                    && requested.Any(r => string.Equals(o.Name, r, StringComparison.OrdinalIgnoreCase)
+                        || r.EndsWith("." + o.Name, StringComparison.OrdinalIgnoreCase)
+                        || o.Name.EndsWith("." + r, StringComparison.OrdinalIgnoreCase)))
+                .ToList();
+            if (pending.Count == 0) return;
+
+            foreach (DatabaseObjectMetadata synonym in pending)
+            {
+                token.ThrowIfCancellationRequested();
+                try
+                {
+                    var columns = await Task.Run(() => DescribeSynonym(info, synonym.SynonymBaseObjectName, token), token).ConfigureAwait(false);
+                    lock (synonym.Columns)
+                        if (synonym.Columns.Count == 0) synonym.Columns.AddRange(columns);
+                    CompletionTrace.Write("synonym '" + synonym.QualifiedName + "' base='" + synonym.SynonymBaseObjectName
+                        + "' columns=" + columns.Count);
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
+                {
+                    // An unreadable base object only costs the columns of that synonym.
+                    CompletionTrace.Failure("synonym '" + synonym.QualifiedName + "' columns could not be resolved", ex);
+                }
+            }
         }
+
+        private static string CleanName(string value) => (value ?? string.Empty).Replace("[", "").Replace("]", "").Trim();
 
         private static List<ColumnMetadata> DescribeSynonym(ScriptFactoryAccess.ConnectionInfo info, string baseObjectName, CancellationToken token)
         {
@@ -316,10 +117,12 @@ namespace MSSQLTool.Completion
         // object names and columns — the data every completion popup needs —
         // are available, typically within a second or two. The heavy catalog
         // queries that only enrich tooltips, JOIN hints and detail views
-        // (definitions, foreign keys, indexes, constraints, descriptions,
-        // row counts) continue in the background (Enrich) on the same
-        // snapshot instance, so later requests find them already merged in.
-        private static MetadataSnapshot Load(ScriptFactoryAccess.ConnectionInfo info, string database = null)
+        // (foreign keys, indexes, constraints, descriptions, row counts)
+        // continue in the background (Enrich) on the same snapshot instance,
+        // so later requests find them already merged in.  Object definitions are
+        // no longer part of this pass; they are fetched per object on demand.
+        private static async Task<MetadataSnapshot> LoadCoreAsync(ScriptFactoryAccess.ConnectionInfo info, string database,
+            CancellationToken token, bool reportProgress)
         {
             var builder = new SqlConnectionStringBuilder(info.FullConnectionString);
             if (!string.IsNullOrWhiteSpace(database)) builder.InitialCatalog = database;
@@ -341,35 +144,51 @@ namespace MSSQLTool.Completion
                     using (var connection = CreateMetadataConnection(info, database))
                     {
                         connection.Open();
-                        LoadProgress.Step("databases");
+                        if (reportProgress) LoadProgress.Step("databases");
                         TryLoadDatabases(connection, result, backgroundErrors);
-                        LoadProgress.Step("linked servers");
+                        if (reportProgress) LoadProgress.Step("linked servers");
                         TryLoadLinkedServers(connection, result, backgroundErrors);
-                        LoadProgress.Step("parameters");
+                        if (reportProgress) LoadProgress.Step("parameters");
                         TryLoadParameters(connection, backgroundParameters, backgroundErrors);
-                        LoadProgress.Step("synonyms, sequences and types");
+                        if (reportProgress) LoadProgress.Step("synonyms, sequences and types");
                         TryLoadSupplementalObjects(connection, backgroundSchemas, backgroundObjects, backgroundErrors);
-                        LoadProgress.Step("compatibility level");
+                        if (reportProgress) LoadProgress.Step("compatibility level");
                         TryLoadCompatibilityLevel(connection, result, backgroundErrors);
                     }
                 }
-                catch (Exception ex) { backgroundFailure = ex; }
-            });
+                catch (Exception ex)
+                {
+                    backgroundFailure = ex;
+                    NoteUnavailableDatabase(info, database, ex);
+                }
+            }, token);
             try
             {
                 using (var connection = CreateMetadataConnection(info, database))
+                using (token.Register(() => { try { connection.Close(); } catch { } }))
                 {
                     connection.Open();
-                    LoadProgress.Step("objects");
+                    if (reportProgress) LoadProgress.Step("objects");
                     TryLoadObjects(connection, result, errors);
-                    LoadProgress.Step("objects", result.Objects.Count);
+                    if (reportProgress) LoadProgress.Step("objects", result.Objects.Count);
+                    token.ThrowIfCancellationRequested();
                     // A separate command: if the column join is slow, the object list stays complete.
                     TryLoadColumns(connection, result, errors);
-                    LoadProgress.Step("columns", result.Objects.Count);
+                    if (reportProgress) LoadProgress.Step("columns", result.Objects.Count);
                 }
             }
-            catch (Exception ex) { RecordFailure("connection", ex, errors); }
-            backgroundTask.Wait();
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                RecordFailure("connection", ex, errors);
+                NoteUnavailableDatabase(info, database, ex);
+            }
+
+            // Await instead of Wait(): blocking a pool thread here starved the same pool the
+            // background chain needs, which made a first load feel like a freeze on a busy editor.
+            await backgroundTask.ConfigureAwait(false);
+            token.ThrowIfCancellationRequested();
+
             result.Parameters.AddRange(backgroundParameters);
             foreach (string schema in backgroundSchemas)
                 if (!result.Schemas.Contains(schema)) result.Schemas.Add(schema);
@@ -382,7 +201,15 @@ namespace MSSQLTool.Completion
                 result.IsPartial = result.Objects.Count > 0 || result.Parameters.Count > 0;
             }
             if (result.Objects.Count > 0)
-                _ = Task.Run(() => Enrich(info, database, result));
+                _ = Task.Run(() => Enrich(info, database, result, token));
+            CompletionTrace.Write("metadata loaded scope='" + result.Scope + "' objects=" + result.Objects.Count
+                + " tables=" + result.Objects.Count(o => o.Kind == CompletionItemKind.Table)
+                + " views=" + result.Objects.Count(o => o.Kind == CompletionItemKind.View)
+                + " synonyms=" + result.Objects.Count(o => o.Kind == CompletionItemKind.Synonym)
+                + " sequences=" + result.Objects.Count(o => o.Kind == CompletionItemKind.Sequence)
+                + " types=" + result.Objects.Count(o => o.Kind == CompletionItemKind.Type)
+                + " databases=" + result.Databases.Count
+                + " errors='" + (result.ErrorMessage ?? string.Empty) + "'");
             return result;
         }
 
@@ -392,7 +219,7 @@ namespace MSSQLTool.Completion
         // (foreign keys, indexes, check constraints) is built privately and
         // swapped in atomically. Failures are log-only — the snapshot is
         // already in use and stays valid without the optional details.
-        private static void Enrich(ScriptFactoryAccess.ConnectionInfo info, string database, MetadataSnapshot result)
+        private static void Enrich(ScriptFactoryAccess.ConnectionInfo info, string database, MetadataSnapshot result, CancellationToken token)
         {
             try
             {
@@ -403,14 +230,17 @@ namespace MSSQLTool.Completion
                     // hash index keeps those lookups O(1) instead of scanning
                     // the whole object list for every single row.
                     var index = new SnapshotObjectIndex(result);
-                    LoadProgress.Step("definitions");
-                    TryLoadDefinitions(connection, result, index);
+                    // Definitions are not part of the bulk pass any more: loading every view and
+                    // procedure body dominated first-load time and resident memory. They are fetched
+                    // per referenced object by EnsureDefinitionsAsync when a tooltip needs them.
                     LoadProgress.Step("foreign keys");
                     TryLoadForeignKeys(connection, result, index);
+                    token.ThrowIfCancellationRequested();
                     LoadProgress.Step("column details");
                     TryLoadColumnDetails(connection, result, index);
                     LoadProgress.Step("indexes");
                     TryLoadIndexes(connection, result, index);
+                    token.ThrowIfCancellationRequested();
                     LoadProgress.Step("check constraints");
                     TryLoadCheckConstraints(connection, result, index);
                     TryLoadRowCounts(connection, result, index);
@@ -518,6 +348,7 @@ namespace MSSQLTool.Completion
 
         private static void TryLoadDatabases(SqlConnection connection, MetadataSnapshot result, List<string> errors)
         {
+            if (!EnsureOpen(connection)) return;
             try
             {
                 using (var command = new SqlCommand("SELECT [name] FROM sys.databases WHERE [state]=0 AND HAS_DBACCESS([name])=1 ORDER BY [name];", connection))
@@ -531,6 +362,7 @@ namespace MSSQLTool.Completion
 
         private static void TryLoadLinkedServers(SqlConnection connection, MetadataSnapshot result, List<string> errors)
         {
+            if (!EnsureOpen(connection)) return;
             try
             {
                 using (var command = new SqlCommand("SELECT [name] FROM sys.servers WHERE server_id > 0 AND is_linked=1 ORDER BY [name];", connection))
@@ -541,6 +373,7 @@ namespace MSSQLTool.Completion
 
         private static void TryLoadObjects(SqlConnection connection, MetadataSnapshot result, List<string> errors)
         {
+            if (!EnsureOpen(connection)) return;
             try
             {
                 using (var command = connection.CreateCommand())
@@ -598,6 +431,7 @@ WHERE o.type IN ('U','V','P','PC','X','FN','IF','TF','FS','FT')
         /// </summary>
         private static void TryLoadColumns(SqlConnection connection, MetadataSnapshot result, List<string> errors)
         {
+            if (!EnsureOpen(connection)) return;
             if (result.Objects.Count == 0) return;
 
             string schema = string.Empty, name = string.Empty;
@@ -654,6 +488,7 @@ WHERE o.type IN ('U','V','FN','IF','TF','FS','FT')
 
         private static void TryLoadDefinitions(SqlConnection connection, MetadataSnapshot result, SnapshotObjectIndex index)
         {
+            if (!EnsureOpen(connection)) return;
             try
             {
                 using (var command = connection.CreateCommand())
@@ -680,6 +515,7 @@ WHERE o.type IN ('V','P','PC','FN','IF','TF','FS','FT')
 
         private static void TryLoadObjectNamesFallback(SqlConnection connection, MetadataSnapshot result, List<string> errors)
         {
+            if (!EnsureOpen(connection)) return;
             try
             {
                 // The command that just failed may have left the connection closed; reopening it keeps
@@ -726,6 +562,7 @@ WHERE o.type IN ('U','V','P','PC','X','FN','IF','TF','FS','FT')
 
         private static void TryLoadForeignKeys(SqlConnection connection, MetadataSnapshot result, SnapshotObjectIndex index)
         {
+            if (!EnsureOpen(connection)) return;
             try
             {
                 var foreignKeys = new List<ForeignKeyMetadata>();
@@ -763,6 +600,7 @@ ORDER BY fk.object_id,fkc.constraint_column_id;";
 
         private static void TryLoadColumnDetails(SqlConnection connection, MetadataSnapshot result, SnapshotObjectIndex index)
         {
+            if (!EnsureOpen(connection)) return;
             try
             {
                 // Object-level descriptions: one row per described object instead
@@ -819,6 +657,7 @@ WHERE o.type IN ('U','V','P','PC','FN','IF','TF','FS','FT')
 
         private static void TryLoadIndexes(SqlConnection connection, MetadataSnapshot result, SnapshotObjectIndex index)
         {
+            if (!EnsureOpen(connection)) return;
             try
             {
                 // Built per object into private lists and swapped in at the
@@ -888,6 +727,7 @@ ORDER BY s.name,o.name,i.index_id,ic.is_included_column,ic.key_ordinal,ic.index_
 
         private static void TryLoadCheckConstraints(SqlConnection connection, MetadataSnapshot result, SnapshotObjectIndex index)
         {
+            if (!EnsureOpen(connection)) return;
             try
             {
                 var byObject = new Dictionary<string, List<CheckConstraintMetadata>>(StringComparer.OrdinalIgnoreCase);
@@ -919,6 +759,7 @@ ORDER BY s.name,o.name,cc.name;";
 
         private static void TryLoadRowCounts(SqlConnection connection, MetadataSnapshot result, SnapshotObjectIndex index)
         {
+            if (!EnsureOpen(connection)) return;
             try
             {
                 using (var command = connection.CreateCommand())
@@ -975,6 +816,7 @@ GROUP BY s.name,o.name;";
 
         private static void TryLoadParameters(SqlConnection connection, List<RoutineParameterMetadata> parameters, List<string> errors)
         {
+            if (!EnsureOpen(connection)) return;
             try
             {
                 using (var command = connection.CreateCommand())
@@ -996,40 +838,165 @@ ORDER BY o.object_id,p.parameter_id;";
         {
             errors.Add(area + ": " + exception.Message);
             FeatureDiagnostics.Report("SQL Completion Metadata", "Could not load " + area, exception);
-            MSSQLToolPackage._logger?.Error(exception, "SQL completion metadata could not load " + area);
+            // A database this login cannot open (offline, restoring, single-user, no permission) is
+            // a normal state of a multi-database script, not a defect.  The full stack trace used to
+            // fill hundreds of log lines per session and hide everything else, so it is reduced to
+            // one line; genuinely unexpected failures keep the exception.
+            if (IsUnavailableDatabase(exception))
+                MSSQLToolPackage._logger?.Warn("SQL completion metadata could not load " + area + ": " + FirstLine(exception.Message));
+            else
+                MSSQLToolPackage._logger?.Error(exception, "SQL completion metadata could not load " + area);
+        }
+
+        private static string FirstLine(string value)
+        {
+            if (string.IsNullOrEmpty(value)) return string.Empty;
+            int index = value.IndexOfAny(new[] { '\r', '\n' });
+            return index < 0 ? value : value.Substring(0, index);
+        }
+
+        /// <summary>
+        /// True for the SqlException numbers that mean "this database cannot be opened by this login"
+        /// (4060 cannot open, 18456 login failed, 4061/4062/4064 name or state, 911/945/983/233
+        /// offline, restoring, single-user or forced disconnect).
+        /// </summary>
+        internal static bool IsUnavailableDatabase(Exception exception)
+        {
+            for (Exception current = exception; current != null; current = current.InnerException)
+            {
+                if (!(current is SqlException sql)) continue;
+                switch (sql.Number)
+                {
+                    case 4060:
+                    case 4061:
+                    case 4062:
+                    case 4064:
+                    case 18456:
+                    case 911:
+                    case 945:
+                    case 983:
+                    case 233:
+                        return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>Cheap text test for a failure that was already flattened into an error string.</summary>
+        internal static bool IsUnavailableDatabaseMessage(string message)
+        {
+            if (string.IsNullOrEmpty(message)) return false;
+            return message.IndexOf("Cannot open database", StringComparison.OrdinalIgnoreCase) >= 0
+                || message.IndexOf("Login failed", StringComparison.OrdinalIgnoreCase) >= 0
+                || message.IndexOf("无法打开数据库", StringComparison.Ordinal) >= 0
+                || message.IndexOf("登录失败", StringComparison.Ordinal) >= 0
+                || message.IndexOf("数据库处于", StringComparison.Ordinal) >= 0;
+        }
+
+        /// <summary>
+        /// Reopens the catalog connection when SQL Server or a command timeout closed it, so one slow
+        /// catalog query cannot take every later catalog down with it.  SqlConnection closes itself
+        /// after a command timeout, which used to turn "parameters timed out" into five extra
+        /// "requires an open connection" errors and an incomplete snapshot.
+        /// </summary>
+        private static bool EnsureOpen(SqlConnection connection)
+        {
+            if (connection == null) return false;
+
+            try
+            {
+                if (connection.State == System.Data.ConnectionState.Open) return true;
+
+                connection.Open();
+                if (connection.State == System.Data.ConnectionState.Open) return true;
+            }
+            catch (Exception ex)
+            {
+                CompletionTrace.Failure("the metadata connection could not be reopened", ex);
+                return false;
+            }
+
+            return false;
         }
 
         private static SqlConnection CreateMetadataConnection(ScriptFactoryAccess.ConnectionInfo info, string database = null)
         {
             bool trustServerCertificate = SettingsManager.GetSqlCompletionSettings().trustServerCertificate;
-            return info.CreateSqlConnection(database, trustServerCertificate);
+            SqlConnection connection = info.CreateSqlConnection(database, trustServerCertificate);
+            // A referenced database that this login cannot open used to burn the editor's whole
+            // login timeout on the first cross-database keystroke.  The primary load keeps the
+            // connection's own timeout; a reference load gives up early and is then remembered as
+            // unavailable instead of being retried on every keystroke.
+            if (!string.IsNullOrWhiteSpace(database))
+            {
+                try
+                {
+                    var builder = new SqlConnectionStringBuilder(connection.ConnectionString);
+                    const int referenceConnectTimeoutSeconds = 5;
+                    if (builder.ConnectTimeout <= 0 || builder.ConnectTimeout > referenceConnectTimeoutSeconds)
+                    {
+                        builder.ConnectTimeout = referenceConnectTimeoutSeconds;
+                        connection.ConnectionString = builder.ConnectionString;
+                    }
+                }
+                catch { }
+            }
+            return connection;
         }
 
         private static void TryLoadSupplementalObjects(SqlConnection connection, List<string> schemas, List<DatabaseObjectMetadata> objects, List<string> errors)
         {
+            if (!EnsureOpen(connection)) return;
+            // One query per catalog.  A login that cannot read sys.synonyms used to lose sequences and
+            // user-defined types as well, and the completion list then looked like it had never been
+            // loaded; each catalog now fails on its own and says so in the log.
+            TryLoadSupplementalCatalog(connection, schemas, objects, errors, "synonyms",
+                "SELECT s.name,n.name,'SN',n.base_object_name FROM sys.synonyms n JOIN sys.schemas s ON s.schema_id=n.schema_id;");
+            TryLoadSupplementalCatalog(connection, schemas, objects, errors, "sequences",
+                "SELECT s.name,q.name,'SQ',NULL FROM sys.sequences q JOIN sys.schemas s ON s.schema_id=q.schema_id;");
+            TryLoadSupplementalCatalog(connection, schemas, objects, errors, "user-defined types",
+                "SELECT s.name,t.name,'TY',NULL FROM sys.types t JOIN sys.schemas s ON s.schema_id=t.schema_id WHERE t.is_user_defined=1;");
+        }
+
+        private static void TryLoadSupplementalCatalog(SqlConnection connection, List<string> schemas,
+            List<DatabaseObjectMetadata> objects, List<string> errors, string catalog, string sql)
+        {
+            if (!EnsureOpen(connection)) return;
+            int loaded = 0;
             try
             {
                 using (var command = connection.CreateCommand())
                 {
                     command.CommandTimeout = 15;
-                    command.CommandText = @"
-SELECT s.name,n.name,'SN',n.base_object_name FROM sys.synonyms n JOIN sys.schemas s ON s.schema_id=n.schema_id
-UNION ALL SELECT s.name,q.name,'SQ',NULL FROM sys.sequences q JOIN sys.schemas s ON s.schema_id=q.schema_id
-UNION ALL SELECT s.name,t.name,'TY',NULL FROM sys.types t JOIN sys.schemas s ON s.schema_id=t.schema_id WHERE t.is_user_defined=1;";
+                    command.CommandText = sql;
                     using (var reader = command.ExecuteReader())
                         while (reader.Read())
                         {
                             string schema = reader.GetString(0), name = reader.GetString(1), type = reader.GetString(2);
                             if (!schemas.Contains(schema)) schemas.Add(schema);
-                            objects.Add(new DatabaseObjectMetadata { Database = connection.Database, Schema = schema, Name = name, Kind = type == "SN" ? CompletionItemKind.Synonym : type == "SQ" ? CompletionItemKind.Sequence : CompletionItemKind.Type, SynonymBaseObjectName = reader.IsDBNull(3) ? null : reader.GetString(3) });
+                            objects.Add(new DatabaseObjectMetadata
+                            {
+                                Database = connection.Database,
+                                Schema = schema,
+                                Name = name,
+                                Kind = type == "SN" ? CompletionItemKind.Synonym : type == "SQ" ? CompletionItemKind.Sequence : CompletionItemKind.Type,
+                                SynonymBaseObjectName = reader.IsDBNull(3) ? null : reader.GetString(3)
+                            });
+                            loaded++;
                         }
                 }
+                CompletionTrace.Write("metadata " + catalog + "=" + loaded + " database=" + connection.Database);
             }
-            catch (Exception ex) { RecordFailure("synonyms, sequences and types", ex, errors); }
+            catch (Exception ex)
+            {
+                RecordFailure(catalog, ex, errors);
+                CompletionTrace.Failure("metadata " + catalog + " could not be loaded", ex);
+            }
         }
 
         private static void TryLoadCompatibilityLevel(SqlConnection connection, MetadataSnapshot result, List<string> errors)
         {
+            if (!EnsureOpen(connection)) return;
             try
             {
                 using (var command = new SqlCommand("SELECT compatibility_level FROM sys.databases WHERE database_id=DB_ID();", connection))

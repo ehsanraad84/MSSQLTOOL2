@@ -444,6 +444,12 @@ namespace MSSQLTool.RegressionTests
             Run("Completion: predicate separates operands and operators", TestPredicateCompletionKeepsOperandsAndOperatorsApart);
             Run("Completion: predicate handles BETWEEN and groups", TestPredicateCompletionHandlesBetweenAndGroups);
             RunCompletionSelectionTests();
+            RunCrossDatabaseTests();
+            RunSynonymCompletionTests();
+            RunRuntimeLogTests();
+            RunLogRedactionTests();
+            RunMetadataCacheTests();
+        RunLogModuleTests();
             RunCompletionCorpusTests();            RunCompletionPerformanceTests();
             RunCompletionParameterInfoTests();
             RunUpdateHelperTests();
@@ -477,6 +483,7 @@ namespace MSSQLTool.RegressionTests
         Run("Results: analytics text is tab separated", TestGridAnalyticsTextIsTabSeparated);
          Run("Results: analytics uses the real field name", TestGridAnalyticsUsesTheRealFieldName);
          Run("Results: column search cycles through matches", TestGridAnalyticsFindsTheNextColumn);
+        Run("Results: filter searches the ticked columns", TestGridAnalyticsFilterSearchesTheTickedColumns);
          Run("History: databases use the renamed files", TestHistoryDatabasesUseTheRenamedFiles);
         Run("History: query text entry shows a preview", TestQueryTextHistoryEntryShowsAPreview);
         Run("History: query text hash is stable", TestQueryTextHistoryHashIsStable);
@@ -1158,8 +1165,13 @@ namespace MSSQLTool.RegressionTests
 
         private static void TestPredicateOperators()
         {
-            var items = SqlCompletionAnalyzer.BuildItems(SqlCompletionAnalyzer.Analyze("SELECT * FROM dbo.Customer c WHERE ", 35), Metadata());
-            True(items.Exists(x => x.DisplayText == "IS NULL"));
+            // The popup shows the head of the ranked list (50 rows by default), so relevance is
+            // asserted on the candidate set: "IS NULL" must still be offered after WHERE, and it is
+            // what the list narrows to once a letter is typed.
+            CompletionContext context = SqlCompletionAnalyzer.Analyze("SELECT * FROM dbo.Customer c WHERE ", 35);
+            var candidates = SqlCompletionAnalyzer.BuildCandidates(context, Metadata());
+            True(candidates.Exists(x => x.DisplayText == "IS NULL"));
+            True(SqlCompletionAnalyzer.FilterCandidates(candidates, "IS").Exists(x => x.DisplayText == "IS NULL"));
         }
 
         private static void TestDerivedScope()

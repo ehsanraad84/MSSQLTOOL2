@@ -1,4 +1,4 @@
-using Microsoft.Win32;
+﻿using Microsoft.Win32;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -430,12 +430,32 @@ ORDER BY sd.[name];
             public bool enabled = true;
             public bool automaticPopup = true;
             public bool autoRefreshMetadata = true;
+            /// <summary>Start loading object/column names as soon as a query window opens, instead of
+            /// waiting for the first suggestion. The load runs in the background.</summary>
+            public bool prefetchMetadata = true;
+            /// <summary>Minutes between catalog signature checks. 0 disables the periodic check; a
+            /// manual refresh and DDL detection still apply.</summary>
+            public int validateMetadataMinutes = 5;
+            /// <summary>Keep a names/columns-only snapshot on disk so a cold SSMS start can serve
+            /// completions before the live load finishes. Definitions are never written.</summary>
+            public bool persistMetadataCache = false;
+            /// <summary>How many database snapshots stay resident; the least recently used is dropped.</summary>
+            public int metadataCacheMaxDatabases = 4;
             public bool trustServerCertificate = true;
             public bool useSquareBrackets = true;
             public bool showObjectDetails = true;
         public bool preferRecentlyUsed = true;
             public bool enableColumnPicker = true;
             public bool autoAddAliases = false;
+            /// <summary>Test mode (Diagnostics page): while it is on, the extension records runtime
+            /// diagnostics — timing, completion scope, metadata loads and popup decisions — and shows
+            /// them live in the Diagnostics tab.  Off by default; switching it off stops all of it.</summary>
+            public bool testMode = false;
+            /// <summary>Detailed autocomplete log (Diagnostics page): only while this is on does the
+            /// completion pipeline record the statement context, the analyzed completion context, the
+            /// caret position and the popup contents.  Off by default; it produces a lot of text, so it
+            /// is a second switch on top of test mode.</summary>
+            public bool detailedCompletionLog = false;
             public string aliasPrefixToIgnore = "tbl_,vw_";
             public string customAliases = string.Empty;
             /// <summary>Extra completion keywords, separated by ";" or new lines.  Lets a team add its own house style (for example "WITH (NOLOCK)" or internal prefixes) without a rebuild.</summary>
@@ -450,12 +470,14 @@ ORDER BY sd.[name];
             /// <summary>Show the statistics panel automatically when the result grid is clicked.</summary>
             public bool resultsPanelAutoShow = false;
             public int delayMilliseconds = 0;
-            public int maximumItems = 200;
+            /// <summary>How many rows the popup shows at once.  50 keeps the list readable and
+            /// bounds the per-keystroke filtering cost; typing narrows it further.</summary>
+            public int maximumItems = 50;
             public CompletionCommitKey completionCommitKey = CompletionCommitKey.TabOrEnter;
 
             /// <summary>Settings layout version; 0 means written before the commit key absorbed the Enter switch.</summary>
             public int settingsVersion;
-            public const int CurrentSettingsVersion = 2;
+            public const int CurrentSettingsVersion = 3;
 
             /// <summary>
             /// Legacy 5.545 switch, read to migrate old profiles and never written again.
@@ -465,6 +487,56 @@ ORDER BY sd.[name];
             public bool? enterCommitsCompletion;
 
             public bool ShouldSerializeenterCommitsCompletion() => false;
+        }
+
+        /// <summary>
+        /// Which modules write to the log file.  Every switch defaults to on, so an upgrade keeps the
+        /// log exactly as it was; a module switched off here writes nothing, which makes it possible
+        /// to capture one feature's lines without the rest of the extension's noise.
+        /// </summary>
+        public class LoggingSettings
+        {
+            /// <summary>Settings, commands, updates: everything the switches below do not cover.</summary>
+            public bool logGeneral = true;
+            /// <summary>Completion popup, IntelliSense and the analyzer behind it.</summary>
+            public bool logCompletion = true;
+            /// <summary>Query tab restore and the unclosed-tab snapshot.</summary>
+            public bool logQueryTabs = true;
+            /// <summary>Captured query texts (query history window).</summary>
+            public bool logQueryTextHistory = true;
+            /// <summary>Execution history window and its database.</summary>
+            public bool logExecutionHistory = true;
+            /// <summary>Completion metadata cache: load, merge and schema change refresh.</summary>
+            public bool logMetadataCache = true;
+            /// <summary>Result grid and the statistics panel.</summary>
+            public bool logResultGrid = true;
+            /// <summary>Query templates and snippet insertion.</summary>
+            public bool logQueryTemplates = true;
+
+            /// <summary>One switch per <see cref="LogModule"/>, in enum order.</summary>
+            public bool[] ToArray()
+            {
+                return new[]
+                {
+                    logGeneral, logCompletion, logQueryTabs, logQueryTextHistory,
+                    logExecutionHistory, logMetadataCache, logResultGrid, logQueryTemplates
+                };
+            }
+
+            public void Set(int module, bool enabled)
+            {
+                switch ((LogModule)module)
+                {
+                    case LogModule.General: logGeneral = enabled; break;
+                    case LogModule.Completion: logCompletion = enabled; break;
+                    case LogModule.QueryTabs: logQueryTabs = enabled; break;
+                    case LogModule.QueryTextHistory: logQueryTextHistory = enabled; break;
+                    case LogModule.ExecutionHistory: logExecutionHistory = enabled; break;
+                    case LogModule.MetadataCache: logMetadataCache = enabled; break;
+                    case LogModule.ResultGrid: logResultGrid = enabled; break;
+                    case LogModule.QueryTemplates: logQueryTemplates = enabled; break;
+                }
+            }
         }
 
         public static string GetUiLanguage()
@@ -1104,6 +1176,8 @@ ORDER BY sd.[name];
                 {
                     value.delayMilliseconds = Math.Max(0, Math.Min(1000, value.delayMilliseconds));
                     value.maximumItems = Math.Max(20, Math.Min(1000, value.maximumItems));
+                    value.validateMetadataMinutes = Math.Max(0, Math.Min(1440, value.validateMetadataMinutes));
+                    value.metadataCacheMaxDatabases = Math.Max(1, Math.Min(12, value.metadataCacheMaxDatabases));
                     MigrateCompletionSettings(value);
                     lock (completionCacheLock) { completionCache = value; completionCacheUtc = DateTime.UtcNow; }
                     return value;
@@ -1137,6 +1211,10 @@ ORDER BY sd.[name];
 
             if (settings.completionCommitKey == CompletionCommitKey.Tab && settings.enterCommitsCompletion != false)
                 settings.completionCommitKey = CompletionCommitKey.TabOrEnter;
+
+            // 3: the shipped list length dropped from 200 rows to 50.  A profile still holding the
+            // old default is moved over; a deliberately chosen other value is left alone.
+            if (settings.maximumItems == 200) settings.maximumItems = 50;
 
             settings.enterCommitsCompletion = null;
             settings.settingsVersion = SqlCompletionSettings.CurrentSettingsVersion;
@@ -1261,6 +1339,32 @@ ORDER BY sd.[name];
         {
             bool saved = SaveRegisterValue("AnalysisSettings", JsonConvert.SerializeObject(settings ?? new MSSQLTool.Analysis.AnalysisSettings()));
             if (saved) AnalysisSettingsVersion++;
+            return saved;
+        }
+
+        /// <summary>
+        /// Per-module log switches (Diagnostics page).  A missing value means "log everything", so
+        /// the first read after an upgrade never silences a module.
+        /// </summary>
+        public static LoggingSettings GetLoggingSettings()
+        {
+            try
+            {
+                var value = JsonConvert.DeserializeObject<LoggingSettings>(GetRegisterValue("LoggingSettings"));
+                if (value != null) return value;
+            }
+            catch (Exception ex)
+            {
+                MSSQLToolPackage._logger?.Debug(ex, "Could not read the module log switches.");
+            }
+
+            return new LoggingSettings();
+        }
+
+        public static bool SaveLoggingSettings(LoggingSettings settings)
+        {
+            bool saved = SaveRegisterValue("LoggingSettings", JsonConvert.SerializeObject(settings ?? new LoggingSettings()));
+            if (saved) ModuleLogSettings.Apply(settings);
             return saved;
         }
 

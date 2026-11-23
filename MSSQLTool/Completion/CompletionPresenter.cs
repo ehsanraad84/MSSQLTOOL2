@@ -23,6 +23,9 @@ namespace MSSQLTool.Completion
         [DllImport("user32.dll", SetLastError = true)]
         private static extern bool SetWindowPos(IntPtr window, IntPtr insertAfter, int x, int y, int width, int height, uint flags);
         [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] private static extern bool IsChild(IntPtr parent, IntPtr child);
+        [DllImport("user32.dll")] private static extern bool IsWindow(IntPtr window);
+        [DllImport("user32.dll")] private static extern IntPtr SetFocus(IntPtr window);
         [DllImport("user32.dll")] private static extern IntPtr GetAncestor(IntPtr window, uint flags);
         [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
         [DllImport("kernel32.dll")] private static extern uint GetCurrentProcessId();
@@ -33,7 +36,19 @@ namespace MSSQLTool.Completion
         private const uint SwpShowWindow = 0x0040;
         private const uint GaRoot = 2;
 
-        private readonly Form window;
+        /// <summary>How long after a click the session poll treats the popup as still being used, so it
+        /// does not dismiss the window the gesture happened in.</summary>
+        private const int PointerGestureGraceMilliseconds = 1000;
+
+        /// <summary>How long after a click a shell activation change is treated as churn caused by that
+        /// click instead of a real window switch.</summary>
+        private const int PointerActivationGraceMilliseconds = 400;
+
+        private readonly CompletionForm window;
+        private readonly PopupPointerFilter pointerFilter;
+        private bool focusRestorePending;
+        private IntPtr focusBeforePopupClick;
+        private DateTime lastPointerGestureUtc = DateTime.MinValue;
         private IntPtr ownerHandle;
         private int anchorLine = -1;
         private int anchorColumn = 0;
@@ -195,6 +210,112 @@ namespace MSSQLTool.Completion
             };
             window.DpiChanged += (_, __) => UpdateScaledMetrics();
             window.FormClosing += Window_FormClosing;
+            window.SizeMoveFinished += OnPopupSizeMoveFinished;
+            category.DropDownClosed += (_, __) => PostFocusRestore();
+            // WinForms hands the Win32 keyboard focus to the clicked control even though the popup
+            // is non-activating (verified: the ListBox handle becomes the focus window).  That is
+            // what made the SQL editor lose focus on every click, and it is why the shell and the
+            // 200 ms poll answered with a dismissal.  The filter keeps the editor focused.
+            pointerFilter = new PopupPointerFilter(this);
+            Application.AddMessageFilter(pointerFilter);
+        }
+
+        private void OnPopupSizeMoveFinished()
+        {
+            lastPointerGestureUtc = DateTime.UtcNow;
+            PostFocusRestore();
+        }
+
+        /// <summary>
+        /// Notices a pointer gesture that belongs to the popup.  Only focus is handled here; the
+        /// click itself is never swallowed.
+        /// </summary>
+        private void OnPopupPointerMessage(IntPtr target)
+        {
+            try
+            {
+                if (!window.Visible || !window.IsHandleCreated || target == IntPtr.Zero) return;
+                if (target != window.Handle && !IsChild(window.Handle, target)) return;
+                lastPointerGestureUtc = DateTime.UtcNow;
+                // Remember what had the keyboard before the click: that is the editor host window the
+                // popup must hand focus back to.
+                if (focusBeforePopupClick == IntPtr.Zero)
+                {
+                    IntPtr current = GetFocus();
+                    if (current != IntPtr.Zero && current != window.Handle && !IsChild(window.Handle, current))
+                        focusBeforePopupClick = current;
+                }
+                CompletionTrace.Write("pointer target=" + CompletionTrace.Describe(target) + " " + CompletionTrace.State(window.Handle)
+                    + " restoreFrom=" + CompletionTrace.Describe(focusBeforePopupClick) + " droppedDown=" + category.DroppedDown);
+                // The category drop-down is a separate window that needs its own focus while it is
+                // open; taking the keyboard back would close it on the first click.
+                if (category.DroppedDown) return;
+                if (target == category.Handle || (category.IsHandleCreated && IsChild(category.Handle, target))) return;
+                PostFocusRestore();
+            }
+            catch (Exception ex)
+            {
+                CompletionTrace.Failure("pointer handling failed", ex);
+            }
+        }
+
+        /// <summary>
+        /// Returns the keyboard to the editor after a click inside the popup.  Posted rather than
+        /// called inline: the control has to finish its own mouse handling (selecting the row,
+        /// moving the splitter) before focus is taken away again.
+        /// </summary>
+        private void PostFocusRestore()
+        {
+            if (focusRestorePending || !window.IsHandleCreated) return;
+            focusRestorePending = true;
+            try
+            {
+                window.BeginInvoke((Action)RestoreEditorFocus);
+            }
+            catch (Exception)
+            {
+                focusRestorePending = false;
+            }
+        }
+
+        private void RestoreEditorFocus()
+        {
+            focusRestorePending = false;
+            IntPtr previous = focusBeforePopupClick;
+            focusBeforePopupClick = IntPtr.Zero;
+            try
+            {
+                IVsTextView target = lastTextView;
+                if (!window.Visible || !window.IsHandleCreated) return;
+                IntPtr popup = window.Handle;
+                // Only step in when the popup really holds the keyboard; when the editor still has
+                // it, forcing focus would needlessly restart the editor's input session.
+                if (!PopupHasFocus(popup)) return;
+
+                // First choice: give the keyboard back to the very window that had it before the
+                // click, so nothing about the editor session changes.
+                if (previous != IntPtr.Zero && IsWindow(previous))
+                {
+                    SetFocus(previous);
+                    if (!PopupHasFocus(popup)) { CompletionTrace.Write("focus restored to=" + CompletionTrace.Describe(previous)); return; }
+                }
+
+                // The editor host is HWND-less in SSMS 22, so the window above may not take focus.
+                // Ask the text view for the focus the supported way instead.
+                target?.SendExplicitFocus();
+                CompletionTrace.Write("focus sent to the editor view=" + (target == null ? "null" : "set") + " " + CompletionTrace.State(popup));
+            }
+            catch (Exception ex)
+            {
+                MSSQLToolPackage._logger?.Debug(ex, "The editor focus could not be restored after a click in the completion popup.");
+            }
+        }
+
+        private static bool PopupHasFocus(IntPtr popup)
+        {
+            IntPtr focus = GetFocus();
+            if (focus == IntPtr.Zero) return false;
+            return focus == popup || IsChild(popup, focus);
         }
 
         private void OnVsThemeChanged(ThemeChangedEventArgs e)
@@ -311,6 +432,33 @@ namespace MSSQLTool.Completion
             if (diagnostic != null) footer.Text += " | Warning: " + diagnostic.Message;
 
             PositionAndShow(textView);
+            CompletionTrace.Write("show kind=" + (context?.Kind.ToString() ?? "null")
+                + " qualifier='" + (context?.Qualifier ?? string.Empty) + "' prefix='" + (context?.Prefix ?? string.Empty) + "'"
+                + " items=" + items.Count + " visible=" + window.Visible + " size=" + window.Width + "x" + window.Height
+                + " at=" + window.Location.X + "," + window.Location.Y
+                + " parameterInfo=" + parameterInfo.Visible);
+            if (CompletionTrace.DetailEnabled)
+            {
+                // Detailed autocomplete: what the window actually contains, row by row, so a report
+                // can be checked against what the user saw.  Bounded — the candidate list can hold
+                // thousands of rows while the popup shows a few dozen.
+                CompletionTrace.Detail("popup visible=" + window.Visible
+                    + " bounds=" + window.Location.X + "," + window.Location.Y + " " + window.Width + "x" + window.Height
+                    + " shown=" + items.Count + " candidates=" + allItems.Count
+                    + " selected=" + list.SelectedIndex
+                    + " category=" + CompletionTrace.Quote(category.SelectedItem as string ?? string.Empty)
+                    + " details=" + !contentSplit.Panel2Collapsed
+                    + " parameterInfo=" + parameterInfo.Visible);
+                CompletionTrace.Detail("popup rows " + CompletionTrace.DescribeItems(items, 50));
+                if (parameterInfo.Visible)
+                    CompletionTrace.Detail("popup parameters=" + CompletionTrace.Quote(
+                        CompletionTrace.Snippet(parameterInfo.Text, 300)));
+                if (!contentSplit.Panel2Collapsed)
+                    CompletionTrace.Detail("popup details=" + CompletionTrace.Quote(
+                        CompletionTrace.Snippet(details.Text, 400)));
+                CompletionTrace.Detail("popup footer=" + CompletionTrace.Quote(
+                    CompletionTrace.Snippet(footer.Text, 300)));
+            }
             // The strip wraps against the popup width, so its height is only final once the
             // window has the size it is shown with.  Re-measuring every keystroke forces a full
             // layout pass, so only the visible text or the width triggers it.
@@ -348,6 +496,9 @@ namespace MSSQLTool.Completion
                 ? LocalizationManager.T("Metadata loading — suggestions will appear when ready.")
                 : progress;
             PositionAndShow(textView);
+            if (CompletionTrace.DetailEnabled)
+                CompletionTrace.Detail("popup loading shown=0 footer=" + CompletionTrace.Quote(
+                    CompletionTrace.Snippet(footer.Text, 300)));
         }
 
         private void PositionAndShow(IVsTextView textView)
@@ -499,6 +650,76 @@ namespace MSSQLTool.Completion
 
         /// <summary>True while the popup's real owner is the foreground window.</summary>
         public bool OwnerIsForeground => IsOwnerForeground(ownerHandle);
+
+        /// <summary>
+        /// True while the foreground window belongs to this process: the SSMS frame, the popup, its
+        /// category drop-down or any other SSMS window.  Only another application taking the
+        /// foreground has to close the popup; a shell re-activation of one of its own windows must
+        /// not, and that was what closed the popup on every click.
+        /// </summary>
+        public bool ForegroundIsInProcess
+        {
+            get
+            {
+                try
+                {
+                    IntPtr foreground = GetForegroundWindow();
+                    return foreground == IntPtr.Zero || BelongsToCurrentProcess(foreground);
+                }
+                catch (Exception)
+                {
+                    return true;
+                }
+            }
+        }
+
+        /// <summary>
+        /// True while the popup is being used with the mouse: a splitter or resize border is being
+        /// dragged, the category drop-down is open, or a click inside the popup just happened.  The
+        /// editor caret cannot move during those gestures, so the session poll must not treat the
+        /// popup as abandoned.
+        /// </summary>
+        public bool IsPointerInteracting
+            => window.Visible && (IsPointerGestureActive || MillisecondsSincePointerGesture() < PointerGestureGraceMilliseconds);
+
+        /// <summary>
+        /// True while a click inside the popup may still be settling.  Window activation raised by
+        /// such a click must not be read as "another window was activated" and close the popup.
+        /// </summary>
+        internal bool IsPointerClickSettling
+            => window.Visible && (IsPointerGestureActive || MillisecondsSincePointerGesture() < PointerActivationGraceMilliseconds);
+
+        private bool IsPointerGestureActive
+        {
+            get
+            {
+                try
+                {
+                    // A resize/move gesture keeps the popup busy even while the pointer is dragged
+                    // outside its bounds; the drop-down is a window of its own that owns the pointer.
+                    return window.IsInSizeMove || category.DroppedDown
+                        || window.Capture || contentSplit.Capture || list.Capture;
+                }
+                catch (Exception)
+                {
+                    return false;
+                }
+            }
+        }
+
+        private double MillisecondsSincePointerGesture()
+        {
+            if (lastPointerGestureUtc == DateTime.MinValue) return double.MaxValue;
+            return (DateTime.UtcNow - lastPointerGestureUtc).TotalMilliseconds;
+        }
+
+        /// <summary>
+        /// The session poll's decision.  A popup the user is clicking or dragging stays open even
+        /// though no keystroke arrives; it is closed only when another application took the
+        /// foreground, or when the caret really moved somewhere else in the editor.
+        /// </summary>
+        internal static bool ShouldDismissFromPoll(bool foregroundInProcess, bool pointerInteracting, bool caretCurrent)
+            => !foregroundInProcess || (!pointerInteracting && !caretCurrent);
 
         /// <summary>
         /// Resolves the visual top-left corner of the caret in screen coordinates together with
@@ -736,6 +957,7 @@ namespace MSSQLTool.Completion
 
         private void Window_FormClosing(object sender, FormClosingEventArgs e)
         {
+            CompletionTrace.Write("form closing reason=" + e.CloseReason + " cancel=" + (e.CloseReason == CloseReason.UserClosing));
             if (e.CloseReason != CloseReason.UserClosing)
                 return;
 
@@ -1051,10 +1273,11 @@ namespace MSSQLTool.Completion
                 || right.EndsWith("." + left, StringComparison.OrdinalIgnoreCase);
         }
 
-        public void Hide()
+        public void Hide(string reason = null)
         {
             userMovedSelection = false;
             if (!window.Visible) return;
+            CompletionTrace.Write("HIDE reason=" + (reason ?? "unspecified") + " " + CompletionTrace.State(window.IsHandleCreated ? window.Handle : IntPtr.Zero));
             window.Hide();
         }
 
@@ -1106,6 +1329,7 @@ namespace MSSQLTool.Completion
         }
         public void Dispose()
         {
+            try { Application.RemoveMessageFilter(pointerFilter); } catch (Exception) { }
             if (themeEventSubscribed)
             {
                 try { VSColorTheme.ThemeChanged -= OnVsThemeChanged; } catch { }
@@ -1126,8 +1350,53 @@ namespace MSSQLTool.Completion
             public IntPtr Handle { get; }
         }
 
+        /// <summary>
+        /// Watches the UI thread's input queue for clicks that land inside the completion popup and
+        /// hands the keyboard back to the editor afterwards.  It never consumes a message.
+        /// </summary>
+        private sealed class PopupPointerFilter : IMessageFilter
+        {
+            private const int WmNcLButtonDown = 0x00A1;
+            private const int WmNcLButtonUp = 0x00A2;
+            private const int WmLButtonDown = 0x0201;
+            private const int WmLButtonUp = 0x0202;
+            private const int WmLButtonDblClk = 0x0203;
+
+            private readonly CompletionPresenter owner;
+
+            public PopupPointerFilter(CompletionPresenter owner) { this.owner = owner; }
+
+            public bool PreFilterMessage(ref Message m)
+            {
+                switch (m.Msg)
+                {
+                    case WmLButtonDown:
+                    case WmLButtonUp:
+                    case WmLButtonDblClk:
+                    case WmNcLButtonDown:
+                    case WmNcLButtonUp:
+                        owner.OnPopupPointerMessage(m.HWnd);
+                        break;
+                }
+                // The click must still reach the list, the splitter or the resize border.
+                return false;
+            }
+        }
+
         private sealed class CompletionForm : Form
         {
+            private const int WmMouseActivate = 0x0021;
+            private const int WmEnterSizeMove = 0x0231;
+            private const int WmExitSizeMove = 0x0232;
+            private const int MaNoActivate = 3;
+
+            /// <summary>Raised when a move/resize gesture starts or ends.</summary>
+            public event Action SizeMoveFinished;
+
+            /// <summary>True between WM_ENTERSIZEMOVE and WM_EXITSIZEMOVE, i.e. while the user
+            /// drags the border to move or resize the popup.</summary>
+            public bool IsInSizeMove { get; private set; }
+
             protected override bool ShowWithoutActivation => true;
 
             // WS_EX_NOACTIVATE: clicking the popup (list, details pane, resize
@@ -1139,6 +1408,33 @@ namespace MSSQLTool.Completion
                     CreateParams cp = base.CreateParams;
                     cp.ExStyle |= 0x08000000; // WS_EX_NOACTIVATE
                     return cp;
+                }
+            }
+
+            protected override void WndProc(ref Message m)
+            {
+                // The style alone is not enough: WinForms still lets the clicked window activate
+                // itself.  Answering "activate nothing" keeps the SSMS frame in front, so the
+                // session poll does not read the click as a lost foreground.
+                if (m.Msg == WmMouseActivate)
+                {
+                    CompletionTrace.Write("WM_MOUSEACTIVATE answered MA_NOACTIVATE");
+                    m.Result = (IntPtr)MaNoActivate;
+                    return;
+                }
+
+                base.WndProc(ref m);
+
+                if (m.Msg == WmEnterSizeMove)
+                {
+                    IsInSizeMove = true;
+                    CompletionTrace.Write("size/move gesture started");
+                }
+                else if (m.Msg == WmExitSizeMove)
+                {
+                    IsInSizeMove = false;
+                    CompletionTrace.Write("size/move gesture finished size=" + Width + "x" + Height);
+                    try { SizeMoveFinished?.Invoke(); } catch (Exception) { }
                 }
             }
         }

@@ -4,6 +4,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -42,6 +43,11 @@ namespace MSSQLTool.Completion
             new Dictionary<string, CompletionContext>(StringComparer.Ordinal);
         private readonly Queue<string> analysisCacheOrder = new Queue<string>();
         private const int AnalysisCacheCapacity = 8;
+
+        /// <summary>How long a keystroke may wait for a cold metadata snapshot before the loading
+        /// frame is left in place and the publication refreshes it.  A whole catalog read must never
+        /// hold the popup back.</summary>
+        private static readonly TimeSpan MetadataWaitTimeout = TimeSpan.FromMilliseconds(900);
         private readonly Microsoft.VisualStudio.Text.Editor.IWpfTextView layoutView;
         private readonly EventHandler<Microsoft.VisualStudio.Text.Editor.TextViewLayoutChangedEventArgs> layoutChanged;
         private CancellationTokenSource requestCancellation;
@@ -64,7 +70,7 @@ namespace MSSQLTool.Completion
                 if (trackedBuffer != null) trackedBuffer.Changed += OnBufferChanged;
             }
             presenter.CommitRequested += () => CommitCurrent();
-            presenter.DismissRequested += Dismiss;
+            presenter.DismissRequested += () => Dismiss("popup request");
             sessionMonitor = new System.Windows.Forms.Timer { Interval = 200 };
             sessionMonitor.Tick += (_, __) =>
             {
@@ -72,14 +78,19 @@ namespace MSSQLTool.Completion
                 // to be re-anchored explicitly; the same tick keeps the caret/popup contract.
                 if (presenter.IsVisible)
                 {
-                    // The popup is non-activating.  Once another application becomes active it
-                    // must disappear instead of floating above it; the owner is the visible SSMS
-                    // frame, so this check does not depend on the editor's hidden fake HWND.
-                    if (!presenter.OwnerIsForeground) Dismiss();
-                    // Only the caret position matters here; scrolling and resizing are handled by
-                    // LayoutChanged.  Reading the document or repositioning the window on a timer
-                    // is what made typing feel stuttery.
-                    else if (!IsCaretCurrent()) Dismiss();
+                    bool caretCurrent = IsCaretCurrent();
+                    bool pointerInteracting = presenter.IsPointerInteracting;
+                    bool foregroundInProcess = presenter.ForegroundIsInProcess;
+                    // Clicking the popup itself (list row, details pane, resize border) does not
+                    // move the caret and does not leave SSMS: the poll has to ignore that gesture
+                    // instead of closing the window the user is working in.
+                    if (CompletionPresenter.ShouldDismissFromPoll(foregroundInProcess, pointerInteracting, caretCurrent))
+                    {
+                        CompletionTrace.Write("poll dismiss foregroundInProcess=" + foregroundInProcess
+                            + " pointerInteracting=" + pointerInteracting + " caretCurrent=" + caretCurrent
+                            + " line=" + currentLine + " column=" + currentColumn);
+                        Dismiss("poll");
+                    }
                 }
             };
             sessionMonitor.Start();
@@ -98,9 +109,84 @@ namespace MSSQLTool.Completion
                 layoutChanged = (_, __) => { if (presenter.IsVisible) presenter.Reposition(textView); };
                 layoutView.LayoutChanged += layoutChanged;
             }
+
+            // A background refresh (schema change, signature check, prefetch) must reach an open
+            // popup: without this the list kept the pre-DDL columns until the next keystroke.
+            onSnapshotPublished = OnSnapshotPublished;
+            SqlMetadataCache.SnapshotPublished += onSnapshotPublished;
         }
 
         public event Action BeforePopupShown;
+
+        private Action<MetadataSnapshotChange> onSnapshotPublished;
+
+        private static IEnumerable<DatabaseObjectMetadata> ReferencedObjects(IEnumerable<CompletionItem> items)
+        {
+            if (items == null) yield break;
+            foreach (CompletionItem item in items)
+            {
+                if (item == null || item.ObjectSource == null) continue;
+                if (item.ObjectSource.Kind == CompletionItemKind.Table) continue;
+                yield return item.ObjectSource;
+            }
+        }
+
+        /// <summary>
+        /// Rebuilds the visible candidate list from a newly published snapshot. This is what makes
+        /// stale-while-revalidate observable: the popup shows the old columns immediately, then swaps
+        /// in the new ones when the background load finishes, without a keystroke.
+        /// </summary>
+        private void OnSnapshotPublished(MetadataSnapshotChange change)
+        {
+            try
+            {
+                if (change == null || change.Snapshot == null) return;
+                CompletionContext context = cachedContext;
+                if (context == null || ReferenceEquals(cachedMetadata, change.Snapshot)) return;
+                if (!SqlMetadataCache.TryGetConnectionKey(ScriptFactoryAccess.GetCurrentConnectionInfo(), out string key)) return;
+                if (!string.Equals(key, change.Key, StringComparison.OrdinalIgnoreCase)) return;
+
+                // A popup that found nothing (a column added from another window) is closed by the
+                // time the refresh lands.  Dropping the cached list makes the next keystroke analyze
+                // against the new snapshot instead of answering from the stale one.
+                if (!presenter.IsVisible)
+                {
+                    cachedCandidates = null;
+                    cachedMetadata = null;
+                    prefixCache.Clear();
+                    return;
+                }
+
+                List<CompletionItem> candidates = SqlCompletionAnalyzer.BuildCandidates(context, change.Snapshot);
+                if (candidates == null) return;
+
+                cachedCandidates = candidates;
+                cachedMetadata = change.Snapshot;
+                prefixCache.Clear();
+                List<CompletionItem> items = SqlCompletionAnalyzer.FilterCandidates(candidates, context.Prefix);
+                if (items.Count == 0) return;
+
+                uiContext.Post(_ =>
+                {
+                    try
+                    {
+                        if (!presenter.IsVisible || !ReferenceEquals(cachedContext, context) || !IsCaretCurrent()) return;
+                        presenter.Show(textView, items, change.Snapshot, context);
+                    }
+                    catch (Exception ex)
+                    {
+                        FeatureDiagnostics.Report("SQL Completion", "The refreshed completion list could not be shown", ex);
+                    }
+                }, null);
+            }
+            catch (Exception ex)
+            {
+                CompletionTrace.Failure("metadata refresh could not be applied to the popup", ex);
+            }
+        }
+
+        /// <summary>True while a click inside the completion popup may still be settling.</summary>
+        internal bool IsSettlingPopupClick => presenter.IsPointerClickSettling;
 
         public bool IsVisible => presenter.IsVisible;
 
@@ -124,7 +210,7 @@ namespace MSSQLTool.Completion
             {
                 requestCancellation = null;
                 currentContext = null;
-                presenter.Hide();
+                presenter.Hide("settings disabled");
                 return;
             }
             requestCancellation = new CancellationTokenSource();
@@ -135,6 +221,7 @@ namespace MSSQLTool.Completion
             // new statement, a new connection) falls through to the full analysis.
             if (!explicitRequest && TryServeFromSnapshotCache(false))
             {
+                if (RuntimeLog.Enabled) RuntimeLog.Write("REQUEST", "served from the cached candidate list (one keystroke)");
                 return;
             }
 
@@ -163,7 +250,35 @@ namespace MSSQLTool.Completion
                 && cachedMeta.CompatibilityLevel > 0)
                 compatibilityLevel = cachedMeta.CompatibilityLevel;
             var requestMarker = new CompletionContext { IsExplicitRequest = explicitRequest, MetadataScope = metadataScope };
+            if (RuntimeLog.Enabled)
+                RuntimeLog.Write("REQUEST", "trigger=" + (explicitRequest ? "explicit" : "typing")
+                    + " caret=" + line + ":" + column + " docLength=" + text.Length
+                    + " statement=" + window.Start + ".." + (window.Start + beforeCaret.Length)
+                    + " charBefore='" + (beforeCaret.Length == 0 ? string.Empty : beforeCaret[beforeCaret.Length - 1].ToString()) + "'"
+                    + " connection='" + (connection == null ? "<none>" : connection.DisplayName) + "'"
+                    + " scope='" + metadataScope + "' compatibility=" + compatibilityLevel
+                    + " settings{mode=" + settings.completionCommitKey + " delay=" + settings.delayMilliseconds
+                    + " maxItems=" + settings.maximumItems + " details=" + settings.showObjectDetails + "}");
             currentContext = requestMarker;
+            if (CompletionTrace.DetailEnabled)
+            {
+                // Detailed autocomplete: the raw context the keystroke arrived with — the statement
+                // window, both sides of the caret and the switches in force.
+                CompletionTrace.Detail("context trigger=" + (explicitRequest ? "explicit" : "typing")
+                    + " caret=" + line + ":" + column + " offset=" + caretOffset
+                    + " documentLength=" + text.Length + " documentEnd=" + docLastLine + ":" + docLastColumn
+                    + " version=" + currentVersionNumber
+                    + " statementStart=" + window.Start + " statementCaretColumn=" + window.CaretColumn
+                    + " charBefore=" + CompletionTrace.Quote(beforeCaret.Length == 0 ? string.Empty : beforeCaret[beforeCaret.Length - 1].ToString())
+                    + " connection=" + CompletionTrace.Quote(connection?.DisplayName ?? string.Empty)
+                    + " scope=" + CompletionTrace.Quote((metadataScope ?? string.Empty).Replace('|', '/'))
+                    + " compatibility=" + compatibilityLevel
+                    + " settings{mode=" + settings.completionCommitKey + " delay=" + settings.delayMilliseconds
+                    + " maxItems=" + settings.maximumItems + " details=" + settings.showObjectDetails
+                    + " columnPicker=" + settings.enableColumnPicker + "}");
+                CompletionTrace.Detail("context statement=" + CompletionTrace.Quote(
+                    CompletionTrace.Snippet(beforeCaret + "|" + afterCaret, 600)));
+            }
             _ = LoadAndShowAsync(requestMarker, text, window.Start, beforeCaret, line, column, window.CaretColumn,
                 afterCaret, caretOffset, connection, compatibilityLevel, token, explicitRequest, settings.delayMilliseconds);
         }
@@ -236,6 +351,9 @@ namespace MSSQLTool.Completion
             try
             {
                 if (!presenter.IsVisible) BeforePopupShown?.Invoke();
+                if (CompletionTrace.DetailEnabled)
+                    CompletionTrace.Detail("structured source=cache caret=" + line + ":" + column
+                        + " offset=" + caretOffset + " " + CompletionTrace.Describe(context));
                 presenter.Show(textView, items, metadata, context);
                 return true;
             }
@@ -366,6 +484,8 @@ namespace MSSQLTool.Completion
             CancellationToken token, bool explicitRequest, int delayMilliseconds)
         {
             CompletionContext context = requestMarker;
+            var requestWatch = Stopwatch.StartNew();
+            long analysisMilliseconds = 0;
             try
             {
                 if (!explicitRequest)
@@ -378,8 +498,10 @@ namespace MSSQLTool.Completion
                     // expensive analysis instead of queueing it behind the previous one.
                     if (!ReferenceEquals(currentContext, requestMarker)) return;
 
+                    var analysisWatch = Stopwatch.StartNew();
                     context = await Task.Run(() => AnalyzeWithStatementCache(requestMarker, beforeCaret, analysisColumn,
                         afterCaret, documentText, statementStart, compatibilityLevel), token).ConfigureAwait(false);
+                    analysisMilliseconds = analysisWatch.ElapsedMilliseconds;
                 }
                 finally
                 {
@@ -389,6 +511,22 @@ namespace MSSQLTool.Completion
                 context.MetadataScope = requestMarker.MetadataScope;
                 context.CaretLine = caretLine;
                 context.CaretColumn = caretColumn;
+                if (CompletionTrace.DetailEnabled)
+                {
+                    // Detailed autocomplete: caret and the structured data the analyzer produced.
+                    CompletionTrace.Detail("caret line=" + caretLine + " column=" + caretColumn
+                        + " offset=" + documentCaretOffset + " statementStart=" + statementStart
+                        + " analysisColumn=" + analysisColumn
+                        + " replacementStartColumn=" + context.ReplacementStartColumn
+                        + " documentEnd=" + currentDocLastLine + ":" + currentDocLastColumn
+                        + " version=" + currentVersionNumber);
+                    CompletionTrace.Detail("structured source=analyze ms=" + analysisMilliseconds + " "
+                        + CompletionTrace.Describe(context));
+                }
+                if (RuntimeLog.Enabled)
+                    RuntimeLog.Perf("ANALYZE", "kind=" + context.Kind + " prefix='" + context.Prefix + "' qualifier='" + context.Qualifier
+                        + "' target='" + (context.TargetObject ?? string.Empty) + "' aliases=" + context.Aliases.Count
+                        + " suppress=" + context.Suppress + "", analysisMilliseconds);
                 token.ThrowIfCancellationRequested();
                 if (!ReferenceEquals(Interlocked.CompareExchange(ref currentContext, context, requestMarker), requestMarker)) return;
 
@@ -403,14 +541,30 @@ namespace MSSQLTool.Completion
                 // and made the popup visibly disappear/repaint on every keystroke.
                 bool hasCachedMetadata = connection != null
                     && SqlMetadataCache.TryGetCached(connection, out MetadataSnapshot _);
-                if (context.Kind != CompletionContextKind.Member && !hasCachedMetadata)
-                    PostItems(context, SqlCompletionAnalyzer.BuildItems(context, MetadataSnapshot.Empty), MetadataSnapshot.Empty, token);
-                else if (context.Kind == CompletionContextKind.Member && !hasCachedMetadata)
+                if (!hasCachedMetadata)
+                {
+                    // A cold cache used to leave the popup blank for the whole catalog read (more
+                    // than six seconds on a large database).  The frame keeps the keystroke
+                    // responsive and the publication replaces it without another key.
                     _ = ShowLoadingFrameAsync(context, connection, token);
+                    cachedContext = context;
+                    cachedCandidates = null;
+                    cachedMetadata = null;
+                    prefixCache.Clear();
+                }
 
-                MetadataSnapshot metadata = await SqlMetadataCache.GetAsync(connection, token).ConfigureAwait(false);
+                MetadataSnapshot metadata = await SqlMetadataCache.GetAsync(connection, token, MetadataWaitTimeout).ConfigureAwait(false);
+                if (metadata == null)
+                {
+                    // Still loading: the frame stays up and OnSnapshotPublished fills it in.
+                    return;
+                }
+                var referencedWatch = Stopwatch.StartNew();
                 metadata = await LoadReferencedDatabasesAsync(context, connection, metadata, token).ConfigureAwait(false);
                 await SqlMetadataCache.ResolveSynonymColumnsAsync(connection, metadata, context, token).ConfigureAwait(false);
+                if (RuntimeLog.Enabled)
+                    RuntimeLog.Perf("SCOPE", "referenced databases + synonym columns: databases=" + metadata.Databases.Count
+                        + " objects=" + metadata.Objects.Count, referencedWatch.ElapsedMilliseconds);
                 token.ThrowIfCancellationRequested();
                 List<CompletionItem> candidates = SqlCompletionAnalyzer.BuildCandidates(context, metadata);
                 cachedCandidates = candidates;
@@ -418,7 +572,25 @@ namespace MSSQLTool.Completion
                 cachedMetadata = metadata;
                 prefixCache.Clear();
                 cachedCaretOffset = documentCaretOffset;
-                PostItems(context, SqlCompletionAnalyzer.FilterCandidates(candidates, context.Prefix), metadata, token);
+                List<CompletionItem> visible = SqlCompletionAnalyzer.FilterCandidates(candidates, context.Prefix);
+                if (RuntimeLog.Enabled)
+                    RuntimeLog.Perf("RESULT", "candidates=" + candidates.Count + " visible=" + visible.Count
+                        + " objects=" + metadata.Objects.Count + " databases=" + metadata.Databases.Count
+                        + " errors='" + (metadata.ErrorMessage ?? string.Empty) + "'", requestWatch.ElapsedMilliseconds);
+
+                // Nothing matched: most often the snapshot predates a column that was added from
+                // another window.  Refresh just the objects this statement names, so the next
+                // keystroke can offer them without a whole-database reload.
+                if (visible.Count == 0 && !context.Suppress && connection != null)
+                    SqlMetadataCache.RefreshObjectsOnMiss(connection, MissRefreshTargets(context));
+
+                PostItems(context, visible, metadata, token);
+
+                // Definitions are no longer part of the bulk load: fetch the ones this statement
+                // references, bounded, so the first tooltip is complete without paying for the whole
+                // database's procedure bodies.
+                if (SettingsManager.GetSqlCompletionSettings().showObjectDetails)
+                    SqlMetadataCache.EnsureDefinitionsAsync(connection, metadata, ReferencedObjects(candidates));
             }
             catch (OperationCanceledException) { }
             catch (Exception ex)
@@ -436,7 +608,7 @@ namespace MSSQLTool.Completion
                 try
                 {
                     if (!token.IsCancellationRequested && ReferenceEquals(currentContext, context) && IsCurrentSnapshot())
-                        presenter.Hide();
+                        presenter.Hide("empty context");
                 }
                 catch (Exception ex)
                 {
@@ -475,6 +647,13 @@ namespace MSSQLTool.Completion
         private static readonly ConcurrentDictionary<string, MetadataSnapshot> MergedSnapshotCache =
             new ConcurrentDictionary<string, MetadataSnapshot>(StringComparer.Ordinal);
 
+        // The same names the analyzer uses for function completion.  A function call is never a
+        // database reference: "ISNULL(Comment, '')" reported the function as TargetObject, the
+        // fallback below turned it into Initial Catalog=ISNULL, the login answered 4060 and the
+        // keystroke paid the full login timeout.
+        private static readonly HashSet<string> BuiltInFunctionNameSet =
+            new HashSet<string>(SqlCompletionAnalyzer.BuiltInFunctionNames, StringComparer.OrdinalIgnoreCase);
+
         static CompletionController()
         {
             SqlMetadataCache.Invalidated += MergedSnapshotCache.Clear;
@@ -486,22 +665,57 @@ namespace MSSQLTool.Completion
             if (connection == null || current == null) return current ?? MetadataSnapshot.Empty;
             var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var linked = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            // Names only the fallback rule below accepted: they are absent from the current snapshot,
+            // so they may not be databases at all.  A failed guess must not export its connection
+            // error into the merged snapshot — the message would ride along with every later RESULT
+            // and the popup would report a database the script never names.
+            var speculated = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             Action<string> inspect = value =>
             {
                 if (!DatabaseIdentifier.TrySplitSqlServer(value, out List<string> parts)) return;
                 string first = parts.FirstOrDefault();
-                if (!string.IsNullOrWhiteSpace(first) && current.LinkedServers.Any(s => string.Equals(s, first, StringComparison.OrdinalIgnoreCase)))
+                if (string.IsNullOrWhiteSpace(first)) return;
+                if (current.LinkedServers.Any(s => string.Equals(s, first, StringComparison.OrdinalIgnoreCase)))
                 {
                     linked[first] = parts.Count > 1 ? parts[1] : string.Empty;
                     return;
                 }
-                if (!string.IsNullOrWhiteSpace(first) && current.Databases.Any(d => string.Equals(d, first, StringComparison.OrdinalIgnoreCase))
-                    && !string.Equals(first, connection.Database, StringComparison.OrdinalIgnoreCase)) names.Add(first);
+                if (current.Databases.Any(d => string.Equals(d, first, StringComparison.OrdinalIgnoreCase))
+                    && !string.Equals(first, connection.Database, StringComparison.OrdinalIgnoreCase))
+                {
+                    names.Add(first);
+                    return;
+                }
+                // A database name can be missing from the snapshot (a partial load, or a login whose
+                // sys.databases is filtered).  A plain qualifier that is neither a schema, an object
+                // nor an alias can only be a database, so its objects are still worth loading —
+                // otherwise "SELECT * FROM other_db." answers with an empty list.  The metadata cache
+                // remembers the attempt, so a name that turns out not to exist costs one lookup.
+                if (parts.Count != 1) return;
+                // "a." and "c." are aliases or columns that the alias map had not picked up yet; a
+                // one-letter database is legal but rare enough that guessing it is never worth a
+                // login round trip.  Real single-letter databases are still accepted above, where the
+                // name is matched against sys.databases.
+                if (first.Length < 2) return;
+                if (BuiltInFunctionNameSet.Contains(first)) return;
+                if (current.Schemas.Any(s => string.Equals(s, first, StringComparison.OrdinalIgnoreCase))) return;
+                if (current.Objects.Any(o => string.Equals(o.Name, first, StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(o.Schema, first, StringComparison.OrdinalIgnoreCase))) return;
+                if (context.Aliases != null && context.Aliases.Keys.Any(a => string.Equals(a, first, StringComparison.OrdinalIgnoreCase))) return;
+                if (string.Equals(first, connection.Database, StringComparison.OrdinalIgnoreCase)) return;
+                names.Add(first);
+                speculated.Add(first);
             };
             inspect(context.Qualifier);
+            // The target is inspected for every context: "otherdb.dbo.MyFunc(" still needs its database.
+            // What must not happen is a function *name* being read as a database, which is what the
+            // built-in/one-letter guards above reject ("ISNULL(" reported target='ISNULL').
             inspect(context.TargetObject);
             foreach (string source in context.Aliases.Values) inspect(source);
             if (names.Count == 0 && linked.Count == 0) return current;
+            CompletionTrace.Write("referenced load request databases='" + string.Join(",", names) + "' linked='"
+                + string.Join(",", linked.Select(p => p.Key + ">" + p.Value)) + "' knownDatabases=" + current.Databases.Count
+                + " qualifier='" + (context.Qualifier ?? string.Empty) + "' target='" + (context.TargetObject ?? string.Empty) + "'");
 
             string cacheKey = connection.FullConnectionString
                 + "#" + string.Join("|", names.OrderBy(n => n, StringComparer.OrdinalIgnoreCase))
@@ -511,23 +725,66 @@ namespace MSSQLTool.Completion
             MetadataSnapshot merged = CloneSnapshot(current);
             foreach (string name in names)
             {
-                MetadataSnapshot additional = await SqlMetadataCache.GetDatabaseAsync(connection, name, token).ConfigureAwait(false);
-                foreach (DatabaseObjectMetadata item in additional.Objects) merged.Objects.Add(CloneObject(item, true));
-                foreach (RoutineParameterMetadata item in additional.Parameters) merged.Parameters.Add(item);
-                foreach (ForeignKeyMetadata item in additional.ForeignKeys) merged.ForeignKeys.Add(item);
-                if (!string.IsNullOrWhiteSpace(additional.ErrorMessage)) merged.ErrorMessage = additional.ErrorMessage;
+                try
+                {
+                    MetadataSnapshot additional = await SqlMetadataCache.GetDatabaseAsync(connection, name, token).ConfigureAwait(false);
+                    int added = 0;
+                    foreach (DatabaseObjectMetadata item in additional.Objects)
+                    {
+                        DatabaseObjectMetadata copy = CloneObject(item, true);
+                        // The object list of another database is identified by this name; a snapshot
+                        // that lost it would make every "db.schema." list come back empty.
+                        if (string.IsNullOrWhiteSpace(copy.Database)) copy.Database = name;
+                        merged.Objects.Add(copy);
+                        added++;
+                    }
+                    foreach (RoutineParameterMetadata item in additional.Parameters) merged.Parameters.Add(item);
+                    foreach (ForeignKeyMetadata item in additional.ForeignKeys) merged.ForeignKeys.Add(item);
+                    bool isSpeculative = speculated.Contains(name);
+                    if (!string.IsNullOrWhiteSpace(additional.ErrorMessage) && !isSpeculative)
+                        merged.ErrorMessage = additional.ErrorMessage;
+                    CompletionTrace.Write("referenced database '" + name + "' objects=" + added
+                        + (isSpeculative ? " speculative=True" : string.Empty)
+                        + " error='" + (additional.ErrorMessage ?? string.Empty) + "'");
+                }
+                catch (Exception ex)
+                {
+                    // One unavailable database must not take the completion list of the current one
+                    // down with it (that used to surface as "no suggestions at all").
+                    CompletionTrace.Failure("referenced database '" + name + "' could not be loaded", ex);
+                }
             }
             foreach (var pair in linked)
             {
-                MetadataSnapshot additional = await SqlMetadataCache.GetLinkedServerAsync(connection, pair.Key, pair.Value, token).ConfigureAwait(false);
-                foreach (DatabaseObjectMetadata item in additional.Objects) merged.Objects.Add(CloneObject(item, true));
-                foreach (RoutineParameterMetadata item in additional.Parameters) merged.Parameters.Add(item);
-                foreach (var databases in additional.LinkedServerDatabases) merged.LinkedServerDatabases[databases.Key] = databases.Value;
-                if (!string.IsNullOrWhiteSpace(additional.ErrorMessage)) merged.ErrorMessage = additional.ErrorMessage;
+                try
+                {
+                    MetadataSnapshot additional = await SqlMetadataCache.GetLinkedServerAsync(connection, pair.Key, pair.Value, token).ConfigureAwait(false);
+                    foreach (DatabaseObjectMetadata item in additional.Objects) merged.Objects.Add(CloneObject(item, true));
+                    foreach (RoutineParameterMetadata item in additional.Parameters) merged.Parameters.Add(item);
+                    foreach (var databases in additional.LinkedServerDatabases) merged.LinkedServerDatabases[databases.Key] = databases.Value;
+                    if (!string.IsNullOrWhiteSpace(additional.ErrorMessage)) merged.ErrorMessage = additional.ErrorMessage;
+                    CompletionTrace.Write("linked server '" + pair.Key + "' objects=" + additional.Objects.Count
+                        + " error='" + (additional.ErrorMessage ?? string.Empty) + "'");
+                }
+                catch (Exception ex)
+                {
+                    CompletionTrace.Failure("linked server '" + pair.Key + "' could not be loaded", ex);
+                }
             }
             if (MergedSnapshotCache.Count >= 6) MergedSnapshotCache.Clear();
             MergedSnapshotCache[cacheKey] = merged;
             return merged;
+        }
+
+        /// <summary>Objects whose columns the current statement reads, used to refresh a snapshot that
+        /// answered a completion request with nothing.</summary>
+        private static IEnumerable<string> MissRefreshTargets(CompletionContext context)
+        {
+            if (context == null) yield break;
+            if (!string.IsNullOrWhiteSpace(context.TargetObject)) yield return context.TargetObject;
+            if (context.Aliases == null) yield break;
+            foreach (string source in context.Aliases.Values)
+                if (!string.IsNullOrWhiteSpace(source)) yield return source;
         }
 
         internal static DatabaseObjectMetadata CloneObject(DatabaseObjectMetadata source, bool external)
@@ -606,7 +863,7 @@ namespace MSSQLTool.Completion
 
                     if (items.Count == 0 && !CompletionPresenter.HasParameterInfo(metadata, context))
                     {
-                        presenter.Hide();
+                        presenter.Hide("no candidates");
                     }
                     else
                     {
@@ -621,7 +878,7 @@ namespace MSSQLTool.Completion
                 catch (Exception ex)
                 {
                     FeatureDiagnostics.Report("SQL Completion", "The completion list could not be shown", ex);
-                    try { presenter.Hide(); } catch { }
+                    try { presenter.Hide("error"); } catch { }
                 }
             }, null);
         }
@@ -670,12 +927,16 @@ namespace MSSQLTool.Completion
             return true;
         }
 
-        public void Dismiss() { requestCancellation?.Cancel(); presenter.Hide(); }
+        public void Dismiss(string reason = null)
+        {
+            requestCancellation?.Cancel();
+            presenter.Hide(reason);
+        }
 
         private bool CommitCurrent()
         {
             CompletionItem item = presenter.SelectedItem;
-            if (item == null || currentContext == null || !IsCurrentSnapshot()) { Dismiss(); return false; }
+            if (item == null || currentContext == null || !IsCurrentSnapshot()) { Dismiss("commit: stale context"); return false; }
             List<CompletionItem> selectedItems = presenter.SelectedItems;
             bool insertMultipleColumns = selectedItems.Count > 1 && selectedItems.All(i => i.Kind == CompletionItemKind.Column);
             if (textView.GetBuffer(out IVsTextLines lines) != VSConstants.S_OK) return false;
@@ -718,11 +979,16 @@ namespace MSSQLTool.Completion
             finally { Marshal.FreeHGlobal(value); }
             try { CompletionUsageStore.Record(currentContext?.MetadataScope, item); }
             catch (Exception) { }
+            if (CompletionTrace.DetailEnabled)
+                CompletionTrace.Detail("commit kind=" + item.Kind + " display=" + CompletionTrace.Quote(item.DisplayText)
+                    + " inserted=" + CompletionTrace.Quote(CompletionTrace.Snippet(insertText, 200))
+                    + " line=" + line + " range=" + start + ".." + column
+                    + " selected=" + selectedItems.Count + " multiColumn=" + insertMultipleColumns);
             bool requestAfterSnippet = ShouldRequestCompletionAfterCommit(item);
             // The join continuation is the second half of one gesture (Tab, then pick the ON key), so
             // it must open even when the fuzzy-popup setting is off.
             bool explicitSnippetContinuation = currentContext.IsExplicitRequest || item.Kind == CompletionItemKind.Join;
-            Dismiss();
+            Dismiss("commit: " + item.DisplayText);
             if (requestAfterSnippet) Request(explicitSnippetContinuation);
             return true;
         }
@@ -833,6 +1099,11 @@ namespace MSSQLTool.Completion
             diagnosticOverlay?.Dispose();
             editorHost.Dispose();
             presenter.Dispose();
+            if (onSnapshotPublished != null)
+            {
+                SqlMetadataCache.SnapshotPublished -= onSnapshotPublished;
+                onSnapshotPublished = null;
+            }
         }
     }
 }

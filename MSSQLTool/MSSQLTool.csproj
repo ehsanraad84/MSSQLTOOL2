@@ -126,6 +126,10 @@
     <Compile Include="Modules\AuroraCore.cs" />
     <Compile Include="Modules\AsteriskExpansionService.cs" />
     <Compile Include="Modules\FeatureDiagnostics.cs" />
+    <Compile Include="Modules\LogRedaction.cs" />
+    <Compile Include="Modules\RedactedLayoutRenderers.cs" />
+    <Compile Include="Modules\RuntimeLog.cs" />
+    <Compile Include="Modules\LogModules.cs" />
     <Compile Include="Modules\EditorEditTransaction.cs" />
     <Compile Include="Modules\DatabaseIdentifier.cs" />
     <Compile Include="Modules\QueryHistoryPrivacy.cs" />
@@ -304,8 +308,13 @@
     <Compile Include="Completion\CompletionModels.cs" />
     <Compile Include="Completion\CompletionPopupPlacement.cs" />
     <Compile Include="Completion\CompletionPresenter.cs" />
+    <Compile Include="Completion\CompletionTrace.cs" />
     <Compile Include="Completion\SqlCompletionAnalyzer.cs" />
     <Compile Include="Completion\SqlMetadataCache.cs" />
+    <Compile Include="Completion\SqlMetadataCache.Store.cs" />
+    <Compile Include="Completion\MetadataPersistence.cs" />
+    <Compile Include="Completion\MetadataDiagnostics.cs" />
+    <Compile Include="Completion\SchemaChangeAnalyzer.cs" />
     <Compile Include="Completion\SqlCaretPosition.cs" />
     <Compile Include="Completion\SqlSemanticModel.cs" />
     <Compile Include="Completion\SqlSymbolResolver.cs" />

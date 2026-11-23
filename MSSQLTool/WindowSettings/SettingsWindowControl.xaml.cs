@@ -124,11 +124,14 @@ as select 1;
         {
             SubscribeToUpdateResultChanges();
             LoadSavedSettings();
+            InitializeRuntimeLog();
+            InitializeLoggingModules();
         }
 
         private void UserControl_Unloaded(object sender, System.Windows.RoutedEventArgs e)
         {
             UnsubscribeFromUpdateResultChanges();
+            RuntimeLog.Logged -= RuntimeLog_Logged;
             formatPreviewTimer?.Stop();
             formatSaveStatusTimer?.Stop();
         }
@@ -182,6 +185,10 @@ as select 1;
                 CompletionTrustServerCertificate.IsChecked = completionSettings.trustServerCertificate;
                 CompletionSquareBrackets.IsChecked = completionSettings.useSquareBrackets;
                 CompletionAutoRefreshMetadata.IsChecked = completionSettings.autoRefreshMetadata;
+                CompletionPrefetchMetadata.IsChecked = completionSettings.prefetchMetadata;
+                CompletionPersistMetadata.IsChecked = completionSettings.persistMetadataCache;
+                CompletionValidateMinutes.Text = completionSettings.validateMetadataMinutes.ToString();
+                CompletionCacheDatabases.Text = completionSettings.metadataCacheMaxDatabases.ToString();
                 CompletionShowObjectDetails.IsChecked = completionSettings.showObjectDetails;
                 CompletionPreferRecent.IsChecked = completionSettings.preferRecentlyUsed;
                 LoadRecentCompletions();
@@ -236,7 +243,21 @@ as select 1;
                 return;
             }
 
+            if (!int.TryParse(CompletionValidateMinutes.Text, out int validateMinutes) || validateMinutes < 0 || validateMinutes > 1440
+                || !int.TryParse(CompletionCacheDatabases.Text, out int cacheDatabases) || cacheDatabases < 1 || cacheDatabases > 12)
+            {
+                LocalizedMessageBox.Show("The schema check interval must be between 0 and 1440 minutes, and cached databases between 1 and 12.",
+                    "SQL Completion", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
             var completionSettings = SettingsManager.GetSqlCompletionSettings();
+            // Only changes that affect how metadata is loaded invalidate it. Saving an unrelated
+            // option (popup delay, aliases) used to make the next suggestion reload the database.
+            bool metadataLoadingChanged =
+                completionSettings.trustServerCertificate != CompletionTrustServerCertificate.IsChecked.GetValueOrDefault()
+                || completionSettings.persistMetadataCache != CompletionPersistMetadata.IsChecked.GetValueOrDefault()
+                || completionSettings.metadataCacheMaxDatabases != cacheDatabases;
             completionSettings.enabled = UseSqlCompletion.IsChecked.GetValueOrDefault();
             completionSettings.automaticPopup = AutomaticSqlCompletion.IsChecked.GetValueOrDefault();
             completionSettings.trustServerCertificate = CompletionTrustServerCertificate.IsChecked.GetValueOrDefault();
@@ -251,6 +272,10 @@ as select 1;
             completionSettings.additionalKeywords = CompletionAdditionalKeywords.Text ?? string.Empty;
             completionSettings.delayMilliseconds = delay;
             completionSettings.maximumItems = maximumItems;
+            completionSettings.prefetchMetadata = CompletionPrefetchMetadata.IsChecked.GetValueOrDefault();
+            completionSettings.persistMetadataCache = CompletionPersistMetadata.IsChecked.GetValueOrDefault();
+            completionSettings.validateMetadataMinutes = validateMinutes;
+            completionSettings.metadataCacheMaxDatabases = cacheDatabases;
             completionSettings.completionCommitKey = (SettingsManager.CompletionCommitKey)Math.Max(0, Math.Min(2, CompletionCommitKey.SelectedIndex));
             completionSettings.preferRecentlyUsed = CompletionPreferRecent.IsChecked.GetValueOrDefault();
             if (!SettingsManager.SaveSqlCompletionSettings(completionSettings))
@@ -260,10 +285,13 @@ as select 1;
                 return;
             }
 
-            Completion.SqlMetadataCache.InvalidateAll();
+            // Only a change that affects loading invalidates the cache; editing the popup delay or an
+            // alias used to force a full database reload on the next keystroke.
+            if (metadataLoadingChanged) Completion.SqlMetadataCache.InvalidateAll();
 
             SavedMessage();
         }
+
 
         private void LoadRecentCompletions()
         {
@@ -747,6 +775,10 @@ as select 1;
             CompletionTrustServerCertificate.IsChecked = defaults.trustServerCertificate;
             CompletionSquareBrackets.IsChecked = defaults.useSquareBrackets;
             CompletionAutoRefreshMetadata.IsChecked = defaults.autoRefreshMetadata;
+            CompletionPrefetchMetadata.IsChecked = defaults.prefetchMetadata;
+            CompletionPersistMetadata.IsChecked = defaults.persistMetadataCache;
+            CompletionValidateMinutes.Text = defaults.validateMetadataMinutes.ToString();
+            CompletionCacheDatabases.Text = defaults.metadataCacheMaxDatabases.ToString();
             CompletionShowObjectDetails.IsChecked = defaults.showObjectDetails;
             CompletionColumnPicker.IsChecked = defaults.enableColumnPicker;
             CompletionAutoAliases.IsChecked = defaults.autoAddAliases;
@@ -873,6 +905,19 @@ as select 1;
             SettingsManager.SaveOpenAiApiKey(OpenAiApiKey.Password);
 
             SavedMessage();
+        }
+
+        private void Button_ShowCompletionCacheStatus_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                IReadOnlyList<MetadataCacheDiagnostic> entries = Completion.SqlMetadataCache.GetDiagnostics();
+                CompletionCacheDiagnostics.Text = MetadataDiagnosticsFormatter.Format(entries, DateTime.UtcNow);
+            }
+            catch (Exception ex)
+            {
+                CompletionCacheDiagnostics.Text = "Cache status unavailable: " + ex.Message;
+            }
         }
 
         private async void Button_RefreshCompletionMetadata_Click(object sender, RoutedEventArgs e)
@@ -1079,7 +1124,8 @@ as select 1;
             report.AppendLine("MSSQL Tool diagnostics");
             report.AppendLine("Assembly: " + typeof(SettingsWindowControl).Assembly.GetName().Version);
             var connection = ScriptFactoryAccess.GetCurrentOrLastConnectionInfo();
-            report.AppendLine("Connection: " + (connection?.DisplayName ?? "<none>"));
+            // Support reports leave the machine: mask the server, instance, database and login.
+            report.AppendLine("Connection: " + LogRedaction.Redact(connection?.DisplayName ?? "<none>"));
             report.AppendLine("Storage: " + AppPaths.RootSource + " | " + AppPaths.Root
                 + " | settings store: " + (SettingsStore.IsFileBacked ? "file" : "registry"));
             if (!string.IsNullOrEmpty(AppPaths.UnavailableReason))
@@ -1087,8 +1133,289 @@ as select 1;
             foreach (KeyValuePair<string, string> location in AppPaths.DescribeLocations())
                 report.AppendLine("  " + location.Key + ": " + location.Value);
             foreach (FeatureDiagnostic item in FeatureDiagnostics.Snapshot())
-                report.AppendLine($"{item.TimestampUtc:u} [{item.Feature}] {item.Message}{(item.Exception == null ? string.Empty : " | " + item.Exception.Message)}");
+                report.AppendLine($"{item.TimestampUtc:u} [{item.Feature}] {item.Message}{(item.Detail == null ? string.Empty : " | " + item.Detail)}");
             DiagnosticsText.Text = report.ToString();
+        }
+
+        // ------------------------------------------------------------------
+        // Test mode: the switch lives on the Diagnostics page, is remembered with
+        // the SQL completion settings and is applied immediately.  While it is on
+        // the extension records runtime diagnostics (completion scope, metadata
+        // load, timing, popup decisions) and this page shows them as they arrive.
+        // ------------------------------------------------------------------
+        // ------------------------------------------------------------------
+        // Log modules: one switch per feature, applied the moment it is
+        // clicked and remembered with the other settings, so a test session can
+        // capture only the module under investigation.  All switches default to
+        // on, which is exactly the log an earlier version wrote.
+        // ------------------------------------------------------------------
+        private CheckBox[] logModuleCheckBoxes;
+        private bool logModulesInitializing;
+
+        private void InitializeLoggingModules()
+        {
+            logModuleCheckBoxes = new[]
+            {
+                LogModuleCompletion, LogModuleQueryTextHistory, LogModuleExecutionHistory,
+                LogModuleMetadataCache, LogModuleResultGrid, LogModuleQueryTemplates, LogModuleGeneral
+            };
+
+            bool[] values;
+            try { values = SettingsManager.GetLoggingSettings().ToArray(); }
+            catch (Exception ex)
+            {
+                Debug.WriteLine(ex.ToString());
+                values = new[] { true, true, true, true, true, true, true, true };
+            }
+
+            logModulesInitializing = true;
+            try
+            {
+                // ToArray() is in enum order: General first, so map by name instead of index.
+                for (int index = 0; index < logModuleCheckBoxes.Length; index++)
+                {
+                    LogModule module = ModuleOfCheckBox(logModuleCheckBoxes[index]);
+                    logModuleCheckBoxes[index].IsChecked = values[(int)module];
+                }
+            }
+            finally { logModulesInitializing = false; }
+
+            UpdateLogModulesStatus();
+        }
+
+        /// <summary>Enum order, not the visual order: General is last on screen.</summary>
+        private static LogModule ModuleOfCheckBox(CheckBox box)
+        {
+            if (box == null) return LogModule.General;
+            switch (box.Name)
+            {
+                case "LogModuleCompletion": return LogModule.Completion;
+                case "LogModuleQueryTextHistory": return LogModule.QueryTextHistory;
+                case "LogModuleExecutionHistory": return LogModule.ExecutionHistory;
+                case "LogModuleMetadataCache": return LogModule.MetadataCache;
+                case "LogModuleResultGrid": return LogModule.ResultGrid;
+                case "LogModuleQueryTemplates": return LogModule.QueryTemplates;
+                default: return LogModule.General;
+            }
+        }
+
+        private void LogModuleCheckBox_Changed(object sender, RoutedEventArgs e)
+        {
+            if (logModulesInitializing) return;
+            SaveLoggingModules();
+        }
+
+        private void Button_AllLogModules_Click(object sender, RoutedEventArgs e) => SetAllLogModules(true);
+
+        private void Button_NoLogModules_Click(object sender, RoutedEventArgs e) => SetAllLogModules(false);
+
+        private void SetAllLogModules(bool enabled)
+        {
+            if (logModuleCheckBoxes == null) return;
+            logModulesInitializing = true;
+            try
+            {
+                foreach (CheckBox box in logModuleCheckBoxes) box.IsChecked = enabled;
+            }
+            finally { logModulesInitializing = false; }
+            SaveLoggingModules();
+        }
+
+        private void SaveLoggingModules()
+        {
+            try
+            {
+                var settings = new SettingsManager.LoggingSettings();
+                foreach (CheckBox box in logModuleCheckBoxes ?? new CheckBox[0])
+                {
+                    settings.Set((int)ModuleOfCheckBox(box), box.IsChecked.GetValueOrDefault());
+                }
+
+                // SaveLoggingSettings applies the mask as well, so the change is live.
+                SettingsManager.SaveLoggingSettings(settings);
+            }
+            catch (Exception ex)
+            {
+                RuntimeLog.Error("SETTINGS", "log modules could not be saved", ex);
+            }
+
+            UpdateLogModulesStatus();
+            try
+            {
+                if (RuntimeLog.Enabled) RuntimeLog.Write("SETTINGS", "log modules mask=" + ModuleLogSettings.CurrentMask);
+            }
+            catch (Exception) { }
+        }
+
+        private void UpdateLogModulesStatus()
+        {
+            try
+            {
+                if (logModuleCheckBoxes == null) return;
+                int enabled = logModuleCheckBoxes.Count(box => box.IsChecked.GetValueOrDefault());
+                LogModulesStatus.Text = LocalizationManager.Format("recording {0} of {1} modules",
+                    enabled, logModuleCheckBoxes.Length);
+            }
+            catch (Exception) { }
+        }
+
+        private bool runtimeLogInitializing;
+
+        private void InitializeRuntimeLog()
+        {
+            runtimeLogInitializing = true;
+            try
+            {
+                TestModeCheckBox.IsChecked = RuntimeLog.Enabled;
+                DetailedCompletionCheckBox.IsChecked = RuntimeLog.Detailed;
+                // The detailed switch has no effect without test mode, so it stays disabled
+                // until test mode is on instead of looking active and writing nothing.
+                DetailedCompletionCheckBox.IsEnabled = RuntimeLog.Enabled;
+            }
+            finally { runtimeLogInitializing = false; }
+
+            RuntimeLog.Logged -= RuntimeLog_Logged;
+            RuntimeLog.Logged += RuntimeLog_Logged;
+            RuntimeLogText.Text = RuntimeLog.FormatAll();
+            UpdateRuntimeLogStatus();
+            ScrollRuntimeLogToEnd();
+        }
+
+        private void TestModeCheckBox_Changed(object sender, RoutedEventArgs e)
+        {
+            if (runtimeLogInitializing) return;
+            bool enabled = TestModeCheckBox.IsChecked.GetValueOrDefault();
+            RuntimeLog.Enabled = enabled;
+            try
+            {
+                var completionSettings = SettingsManager.GetSqlCompletionSettings();
+                if (completionSettings.testMode != enabled)
+                {
+                    completionSettings.testMode = enabled;
+                    SettingsManager.SaveSqlCompletionSettings(completionSettings);
+                }
+            }
+            catch (Exception ex) { RuntimeLog.Error("SETTINGS", "test mode could not be saved", ex); }
+            DetailedCompletionCheckBox.IsEnabled = enabled;
+
+            if (enabled)
+            {
+                // Everything a report needs to be read: the connection the completion runs
+                // against and the switches that decide what the pipeline does.
+                try
+                {
+                    var connection = ScriptFactoryAccess.GetCurrentOrLastConnectionInfo();
+                    RuntimeLog.Write("SESSION", "connection='" + (connection?.DisplayName ?? "<none>")
+                        + "' server='" + (connection?.ServerName ?? string.Empty)
+                        + "' database='" + (connection?.Database ?? string.Empty) + "'");
+                    var settings = SettingsManager.GetSqlCompletionSettings();
+                    RuntimeLog.Write("SESSION", "settings enabled=" + settings.enabled
+                        + " automaticPopup=" + settings.automaticPopup + " prefetch=" + settings.prefetchMetadata
+                        + " persistCache=" + settings.persistMetadataCache + " delay=" + settings.delayMilliseconds
+                        + " maxItems=" + settings.maximumItems + " details=" + settings.showObjectDetails
+                        + " columnPicker=" + settings.enableColumnPicker + " commit=" + settings.completionCommitKey
+                        + " detailedCompletion=" + settings.detailedCompletionLog);
+                }
+                catch (Exception ex) { RuntimeLog.Error("SESSION", "test mode could not describe the session", ex); }
+            }
+            UpdateRuntimeLogStatus();
+        }
+
+        /// <summary>
+        /// Detailed autocomplete switch: while it (and test mode) is on, every completion request
+        /// records the statement context, the analyzed context, the caret position and the popup
+        /// contents.  Saved with the SQL completion settings so a diagnosis session survives a
+        /// restart; the runtime switch is applied immediately.
+        /// </summary>
+        private void DetailedCompletionCheckBox_Changed(object sender, RoutedEventArgs e)
+        {
+            if (runtimeLogInitializing) return;
+            bool enabled = DetailedCompletionCheckBox.IsChecked.GetValueOrDefault();
+            RuntimeLog.Detailed = enabled;
+            try
+            {
+                var completionSettings = SettingsManager.GetSqlCompletionSettings();
+                if (completionSettings.detailedCompletionLog != enabled)
+                {
+                    completionSettings.detailedCompletionLog = enabled;
+                    SettingsManager.SaveSqlCompletionSettings(completionSettings);
+                }
+            }
+            catch (Exception ex) { RuntimeLog.Error("SETTINGS", "detailed autocomplete could not be saved", ex); }
+            UpdateRuntimeLogStatus();
+        }
+
+        private void RuntimeLog_Logged(RuntimeLogEntry entry)
+        {
+            if (entry == null) return;
+            try
+            {
+                Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    try
+                    {
+                        // Bounded: a long session must not turn the box into a memory hog.
+                        if (RuntimeLogText.Text.Length > 500000) RuntimeLogText.Text = RuntimeLog.FormatAll();
+                        RuntimeLogText.AppendText(entry.Format() + Environment.NewLine);
+                        ScrollRuntimeLogToEnd();
+                        UpdateRuntimeLogStatus();
+                    }
+                    catch (Exception) { }
+                }));
+            }
+            catch (Exception) { }
+        }
+
+        private void ScrollRuntimeLogToEnd()
+        {
+            try { RuntimeLogText.ScrollToEnd(); } catch (Exception) { }
+        }
+
+        private void UpdateRuntimeLogStatus()
+        {
+            try
+            {
+                int count = RuntimeLog.Snapshot().Length;
+                RuntimeLogStatus.Text = RuntimeLog.Enabled
+                    ? LocalizationManager.Format("recording — {0} entries", count)
+                    : LocalizationManager.T("off — enable Test mode to record");
+            }
+            catch (Exception) { }
+        }
+
+        private void Button_ClearRuntimeLog_Click(object sender, RoutedEventArgs e)
+        {
+            RuntimeLog.Clear();
+            RuntimeLogText.Clear();
+            UpdateRuntimeLogStatus();
+        }
+
+        private void Button_CopyRuntimeLog_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(RuntimeLogText.Text)) Clipboard.SetText(RuntimeLogText.Text);
+            }
+            catch (Exception ex)
+            {
+                LocalizedMessageBox.Show("The runtime log could not be copied: " + ex.Message,
+                    "Diagnostics", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
+        }
+
+        private void Button_OpenRuntimeLogFolder_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                string folder = LoggingSetup.CurrentLogFolder;
+                if (string.IsNullOrWhiteSpace(folder) || !Directory.Exists(folder)) folder = AppPaths.Root;
+                Process.Start(new ProcessStartInfo("explorer.exe", "\"" + folder + "\"") { UseShellExecute = true });
+            }
+            catch (Exception ex)
+            {
+                LocalizedMessageBox.Show(LocalizationManager.Format("The folder could not be opened: {0}", ex.Message),
+                    "Diagnostics", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
         }
 
         private void Button_ApplyScriptObjectShortcut_Click(object sender, RoutedEventArgs e)

@@ -8,8 +8,11 @@ namespace MSSQLTool
     {
         public DateTime TimestampUtc { get; set; }
         public string Feature { get; set; }
+        /// <summary>Message with server, database, login and secret values already masked.</summary>
         public string Message { get; set; }
-        public Exception Exception { get; set; }
+        /// <summary>Exception type and message with the same masking applied; this is what the
+        /// diagnostics page prints.</summary>
+        public string Detail { get; set; }
     }
 
     internal static class FeatureDiagnostics
@@ -24,15 +27,17 @@ namespace MSSQLTool
             {
                 TimestampUtc = DateTime.UtcNow,
                 Feature = feature ?? "General",
-                Message = message ?? string.Empty,
-                Exception = exception
+                Message = LogRedaction.Redact(message ?? string.Empty),
+                Detail = exception == null
+                    ? null
+                    : LogRedaction.Redact(exception.GetType().Name + ": " + exception.Message)
             };
             lock (SyncRoot)
             {
                 Items.Enqueue(item);
                 while (Items.Count > Capacity) Items.Dequeue();
             }
-            Trace.WriteLine($"MSSQL Tool [{item.Feature}] {item.Message}{(exception == null ? string.Empty : ": " + exception)}");
+            Trace.WriteLine($"MSSQL Tool [{item.Feature}] {item.Message}{(item.Detail == null ? string.Empty : ": " + item.Detail)}");
         }
 
         public static FeatureDiagnostic[] Snapshot()

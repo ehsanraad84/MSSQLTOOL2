@@ -10,6 +10,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using System.Windows.Data;
 using System.Windows.Input;
 using System.Windows.Media;
@@ -26,8 +27,10 @@ namespace MSSQLTool.Results
     public sealed class GridAnalyticsControl : UserControl, IDisposable
     {
         private const int ScanCap = 50000;
-        // No practical display cap: rows are imported in batches so a large result set stays usable.
-        private const int DisplayCap = 1000000;
+        // Cell-by-cell selection costs about 70 ms per 1000 cells; a click on a header stops here.
+        private const int ColumnSelectionCap = 20000;
+        // Previous/Next walks in-memory hits; a very common substring must not allocate millions.
+        private const int MatchHitCap = 20000;
 
         private readonly TextBlock summary = new TextBlock
         {
@@ -42,14 +45,6 @@ namespace MSSQLTool.Results
             TextWrapping = TextWrapping.Wrap,
             Margin = new Thickness(0, 4, 0, 0)
         };
-        private readonly TextBox search = new TextBox
-        {
-            Width = 180,
-            Height = 26,
-            VerticalContentAlignment = VerticalAlignment.Center,
-            Margin = new Thickness(0, 0, 8, 0),
-            ToolTip = LocalizationManager.T("Filter every column (Ctrl+F)")
-        };
         private readonly ComboBox resultSets = new ComboBox
         {
             Width = 190,
@@ -58,14 +53,55 @@ namespace MSSQLTool.Results
             Visibility = Visibility.Collapsed,
             ToolTip = LocalizationManager.T("Result set")
         };
-        private readonly ComboBox filterColumns = new ComboBox { Width = 150, Height = 26, Margin = new Thickness(0, 0, 4, 0) };
         private readonly ComboBox filterOperators = new ComboBox { Width = 110, Height = 26, Margin = new Thickness(0, 0, 4, 0) };
+
+        // The column picker is a drop-down of checkboxes.  The old single-select combo could only
+        // narrow a search to one column, and with "All columns" chosen the value box did nothing
+        // at all - that was the reported "Apply has no effect" bug.
+        private readonly ToggleButton filterColumnToggle = new ToggleButton
+        {
+            Height = 26,
+            MinWidth = 136,
+            Padding = new Thickness(8, 0, 8, 0),
+            Margin = new Thickness(0, 0, 4, 0),
+            HorizontalContentAlignment = HorizontalAlignment.Left,
+            VerticalContentAlignment = VerticalAlignment.Center,
+            ToolTip = LocalizationManager.T("Choose the columns to search")
+        };
+        private readonly Popup filterColumnPopup = new Popup
+        {
+            // StaysOpen = true so the toggle can open and close it deterministically; a popup that
+            // closes itself on the outside click also swallows the toggle click and reopens.
+            StaysOpen = true,
+            AllowsTransparency = true,
+            Placement = PlacementMode.Bottom
+        };
+        private readonly StackPanel filterColumnList = new StackPanel();
+        private readonly HashSet<int> filterColumnsSelected = new HashSet<int>();
+        private readonly Dictionary<int, CheckBox> filterColumnChecks = new Dictionary<int, CheckBox>();
+        private bool suppressFilterColumnChange;
+        private bool filterColumnListDirty;
+        private readonly TextBlock matchCounter = new TextBlock
+        {
+            FontSize = 11.5,
+            Margin = new Thickness(6, 0, 0, 4),
+            VerticalAlignment = VerticalAlignment.Center,
+            Opacity = 0.8
+        };
+        private Button previousMatchButton;
+        private Button nextMatchButton;
+        private readonly List<MatchHit> matchHits = new List<MatchHit>();
+        private readonly Dictionary<DataRow, HashSet<int>> matchedCells = new Dictionary<DataRow, HashSet<int>>();
+        private int matchIndex = -1;
+        private bool matchHitsCapped;
+        private readonly CellMatchConverter cellMatch;
         private readonly TextBox filterValue = new TextBox
         {
-            Width = 140,
+            Width = 160,
             Height = 26,
             VerticalContentAlignment = VerticalAlignment.Center,
-            Margin = new Thickness(0, 0, 8, 0)
+            Margin = new Thickness(0, 0, 8, 0),
+            ToolTip = LocalizationManager.T("Search the ticked columns (Ctrl+F)")
         };
         private readonly ComboBox freezeCount = new ComboBox
         {
@@ -133,6 +169,30 @@ namespace MSSQLTool.Results
             ToolTip = LocalizationManager.T("Filter fields by name or type")
         };
         private readonly StackPanel fieldList = new StackPanel();
+        private const double MinimumFieldWidth = 150;
+        private const double DefaultFieldWidth = 240;
+        private const double CollapsedFieldWidth = 26;
+        // Auto-fit: wide enough for the content, never wide enough to push the other columns away.
+        private const double MinimumAutoFitWidth = 64;
+        private const double MaximumAutoFitWidth = 320;
+        private const int AutoFitSampleRows = 200;
+        private Style buttonStyle;
+        private readonly Dictionary<int, Border> fieldRows = new Dictionary<int, Border>();
+        private readonly CellTextConverter cellText = new CellTextConverter();
+        private readonly CheckBox showNull = new CheckBox
+        {
+            Content = LocalizationManager.T("Show NULL"),
+            IsChecked = true,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(14, 0, 8, 4),
+            ToolTip = LocalizationManager.T("Show NULL instead of an empty cell")
+        };
+        private ColumnDefinition fieldColumn;
+        private GridSplitter fieldSplitter;
+        private FrameworkElement fieldPanel;
+        private FrameworkElement collapsedFieldStrip;
+        private double expandedFieldWidth = DefaultFieldWidth;
+        private bool fieldPanelCollapsed;
         private static readonly Brush FieldHoverBrush = new SolidColorBrush(Color.FromRgb(238, 243, 250));
         private static readonly Brush FieldActiveBrush = new SolidColorBrush(Color.FromRgb(214, 231, 250));
         private static readonly Brush ColumnHighlightBrush = new SolidColorBrush(Color.FromRgb(226, 238, 252));
@@ -162,6 +222,7 @@ namespace MSSQLTool.Results
         };
         private bool refreshing;
         private bool updatingStats;
+        private bool bulkSelecting;
         private DateTime lastRefreshUtc;
         private readonly DispatcherTimer applyTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) };
         private CancellationTokenSource analysisCts;
@@ -191,15 +252,24 @@ namespace MSSQLTool.Results
 
         public GridAnalyticsControl()
         {
-            Background = (Brush)Application.Current?.TryFindResource("ToolThemeBackgroundBrush") ?? Brushes.Transparent;
+            var panelBackground = ThemeBrush("ToolThemeBackgroundBrush", SystemColors.WindowBrush);
+            Background = panelBackground;
+            // Inherited text colour: without it the controls fall back to whatever the shell leaves
+            // behind, which is where the washed-out button labels came from.
+            Foreground = EnsureReadable(ThemeBrush("ToolThemeForegroundBrush", SystemColors.ControlTextBrush), panelBackground);
+            cellMatch = new CellMatchConverter(this);
             ApplyGridLook(dataGrid);
             ApplyGridLook(statsGrid);
 
             var root = new Grid { Margin = new Thickness(10) };
-            root.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(240) });
+            // Three columns: the field list, a splitter that resizes it, and the results area.  The
+            // field list collapses to a narrow strip (see ApplyFieldPanelState) instead of vanishing.
+            fieldColumn = new ColumnDefinition { Width = new GridLength(expandedFieldWidth), MinWidth = MinimumFieldWidth };
+            root.ColumnDefinitions.Add(fieldColumn);
+            root.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             root.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-            var right = new Grid { Margin = new Thickness(10, 0, 0, 0) };
-            Grid.SetColumn(right, 1);
+            var right = new Grid { Margin = new Thickness(8, 0, 0, 0) };
+            Grid.SetColumn(right, 2);
             right.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             right.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             right.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
@@ -215,16 +285,23 @@ namespace MSSQLTool.Results
             filterBar.Children.Add(resultSets);
             filterBar.Children.Add(new TextBlock
             {
-                Text = LocalizationManager.T("Filter rows:"),
+                Text = LocalizationManager.T("Find value:"),
                 VerticalAlignment = VerticalAlignment.Center,
                 Margin = new Thickness(0, 0, 6, 0)
             });
-            filterBar.Children.Add(search);
-            filterBar.Children.Add(filterColumns);
+            filterBar.Children.Add(filterColumnToggle);
             filterBar.Children.Add(filterOperators);
             filterBar.Children.Add(filterValue);
             filterBar.Children.Add(CreateButton("Apply", ApplyView));
             filterBar.Children.Add(CreateButton("Clear", ClearFilters));
+            previousMatchButton = CreateButton("Previous match", GoToPreviousMatch);
+            nextMatchButton = CreateButton("Next match", GoToNextMatch);
+            previousMatchButton.IsEnabled = false;
+            nextMatchButton.IsEnabled = false;
+            filterBar.Children.Add(previousMatchButton);
+            filterBar.Children.Add(nextMatchButton);
+            filterBar.Children.Add(matchCounter);
+            filterBar.Children.Add(filterColumnPopup);
             Grid.SetRow(filterBar, 1);
             right.Children.Add(filterBar);
 
@@ -234,6 +311,7 @@ namespace MSSQLTool.Results
             actionBar.Children.Add(CreateButton("Export JSON...", ExportJson));
             actionBar.Children.Add(CreateButton("Export INSERT...", ExportInsert));
             actionBar.Children.Add(CreateButton("Copy statistics", CopyStatistics));
+            actionBar.Children.Add(CreateButton("Auto-fit columns", AutoFitColumns));
             actionBar.Children.Add(new TextBlock
             {
                 Text = T("Freeze columns:"),
@@ -241,6 +319,7 @@ namespace MSSQLTool.Results
                 Margin = new Thickness(12, 0, 6, 0)
             });
             actionBar.Children.Add(freezeCount);
+            actionBar.Children.Add(showNull);
             Grid.SetRow(actionBar, 2);
             right.Children.Add(actionBar);
 
@@ -270,28 +349,48 @@ namespace MSSQLTool.Results
             Grid.SetRow(status, 6);
             right.Children.Add(status);
 
-            var fieldPanel = CreateFieldPanel();
+            fieldPanel = CreateFieldPanel();
             Grid.SetColumn(fieldPanel, 0);
             root.Children.Add(fieldPanel);
+
+            fieldSplitter = CreateFieldSplitter();
+            Grid.SetColumn(fieldSplitter, 1);
+            root.Children.Add(fieldSplitter);
+
+            collapsedFieldStrip = CreateCollapsedFieldStrip();
+            Grid.SetColumn(collapsedFieldStrip, 0);
+            root.Children.Add(collapsedFieldStrip);
+
             root.Children.Add(right);
+
+            ApplyFieldPanelState();
 
             Content = root;
 
             BuildStatsColumns();
             BuildFilterControls();
             BuildFreezeSelector();
+            BuildFilterColumnPopup();
 
-            search.TextChanged += (_, __) => ScheduleApplyView();
             filterValue.TextChanged += (_, __) => ScheduleApplyView();
             columnSearch.KeyDown += OnColumnSearchKeyDown;
             columnSearch.TextChanged += (_, __) => { lastFoundOrdinal = -1; lastColumnNeedle = string.Empty; };
             freezeCount.SelectionChanged += (_, __) => { if (!suppressFreezeChange) SetFrozenColumns(freezeCount.SelectedIndex, true); };
-            filterColumns.SelectionChanged += (_, __) => ApplyView();
             filterOperators.SelectionChanged += (_, __) => ApplyView();
             applyTimer.Tick += (_, __) => { applyTimer.Stop(); ApplyView(); };
             resultSets.SelectionChanged += (_, __) => OnResultSetChanged();
             dataGrid.Sorting += OnSorting;
-            dataGrid.SelectedCellsChanged += (_, __) => { ClearColumnHighlight(); UpdateSelectionStatistics(); };
+            dataGrid.SelectedCellsChanged += (_, __) =>
+            {
+                // A bulk column selection is summarised once by SelectWholeColumn.
+                if (bulkSelecting) return;
+                ClearColumnHighlight();
+                UpdateSelectionStatistics();
+                SyncFieldRowFromGrid();
+            };
+            dataGrid.PreviewMouseLeftButtonUp += OnGridPreviewMouseLeftButtonUp;
+            showNull.Checked += (_, __) => OnShowNullChanged();
+            showNull.Unchecked += (_, __) => OnShowNullChanged();
             dataGrid.MouseDoubleClick += OnCellDoubleClick;
             dataGrid.LoadingRow += (_, e) => { e.Row.Header = (e.Row.GetIndex() + 1).ToString(CultureInfo.CurrentCulture); };
             // 271 columns: without virtualization every column header and cell factory is built up front.
@@ -317,6 +416,63 @@ namespace MSSQLTool.Results
 
         private static string T(string text) => LocalizationManager.T(text);
 
+        private Brush ThemeBrush(string key, Brush fallback)
+            => TryFindResource(key) as Brush
+               ?? Application.Current?.TryFindResource(key) as Brush
+               ?? fallback;
+
+        /// <summary>
+        /// Keeps text readable whatever the shell hands us: when the inherited foreground and the
+        /// background are too close in luminance (light grey on white was the reported case), swap
+        /// in black or white instead of drawing text nobody can read.
+        /// </summary>
+        private static Brush EnsureReadable(Brush foreground, Brush background)
+        {
+            Color foregroundColor = (foreground as SolidColorBrush)?.Color ?? SystemColors.ControlTextColor;
+            Color backgroundColor = (background as SolidColorBrush)?.Color ?? SystemColors.WindowColor;
+
+            double lighter = Math.Max(VsThemeBrushResolver.GetRelativeLuminance(foregroundColor),
+                                      VsThemeBrushResolver.GetRelativeLuminance(backgroundColor));
+            double darker = Math.Min(VsThemeBrushResolver.GetRelativeLuminance(foregroundColor),
+                                     VsThemeBrushResolver.GetRelativeLuminance(backgroundColor));
+            double contrast = (lighter + 0.05) / (darker + 0.05);
+            if (contrast >= 4.5) return foreground;
+
+            return VsThemeBrushResolver.GetRelativeLuminance(backgroundColor) > 0.5 ? Brushes.Black : Brushes.White;
+        }
+
+        /// <summary>
+        /// Explicit style for the code-built buttons.  They used to rely on the shell's default
+        /// button look, which left the labels too light to read on the panel background.
+        /// </summary>
+        private Style ButtonStyle()
+        {
+            if (buttonStyle != null) return buttonStyle;
+
+            Brush background = ThemeBrush("ToolThemeButtonBackgroundBrush", new SolidColorBrush(Color.FromRgb(0xF2, 0xF5, 0xF9)));
+            Brush foreground = EnsureReadable(ThemeBrush("ToolThemeForegroundBrush", SystemColors.ControlTextBrush), background);
+            Brush hover = ThemeBrush("ToolThemeButtonHoverBrush", new SolidColorBrush(Color.FromRgb(0xE2, 0xEB, 0xF7)));
+            Brush pressed = ThemeBrush("ToolThemeButtonPressedBrush", new SolidColorBrush(Color.FromRgb(0xD2, 0xE0, 0xF1)));
+            Brush border = ThemeBrush("ToolThemeBorderBrush", new SolidColorBrush(Color.FromRgb(0xBF, 0xC7, 0xD1)));
+
+            var style = new Style(typeof(Button));
+            style.Setters.Add(new Setter(Control.ForegroundProperty, foreground));
+            style.Setters.Add(new Setter(Control.BackgroundProperty, background));
+            style.Setters.Add(new Setter(Control.BorderBrushProperty, border));
+            style.Setters.Add(new Setter(Control.BorderThicknessProperty, new Thickness(1)));
+
+            var over = new Trigger { Property = UIElement.IsMouseOverProperty, Value = true };
+            over.Setters.Add(new Setter(Control.BackgroundProperty, hover));
+            style.Triggers.Add(over);
+
+            var down = new Trigger { Property = ButtonBase.IsPressedProperty, Value = true };
+            down.Setters.Add(new Setter(Control.BackgroundProperty, pressed));
+            style.Triggers.Add(down);
+
+            buttonStyle = style;
+            return buttonStyle;
+        }
+
         private Button CreateButton(string text, Action action)
         {
             var button = new Button
@@ -324,9 +480,36 @@ namespace MSSQLTool.Results
                 Content = T(text),
                 Height = 26,
                 MinWidth = 64,
-                FontSize = 12,
+                FontSize = 12.5,
                 Padding = new Thickness(10, 2, 10, 2),
                 Margin = new Thickness(0, 0, 6, 4),
+                Style = ButtonStyle(),
+                HorizontalContentAlignment = HorizontalAlignment.Center,
+                VerticalContentAlignment = VerticalAlignment.Center
+            };
+            button.Click += (_, __) =>
+            {
+                try { action(); }
+                catch (Exception ex)
+                {
+                    MSSQLToolPackage._logger?.Error(ex, "Results analytics action failed.");
+                    status.Text = LocalizationManager.Format("The action failed: {0}", ex.Message);
+                }
+            };
+            return button;
+        }
+
+        private Button CreateSmallButton(string text, Action action)
+        {
+            var button = new Button
+            {
+                Content = T(text),
+                Height = 22,
+                MinWidth = 0,
+                FontSize = 11.5,
+                Padding = new Thickness(6, 0, 6, 0),
+                Margin = new Thickness(0, 0, 6, 0),
+                Style = ButtonStyle(),
                 HorizontalContentAlignment = HorizontalAlignment.Center,
                 VerticalContentAlignment = VerticalAlignment.Center
             };
@@ -344,9 +527,6 @@ namespace MSSQLTool.Results
 
         private void BuildFilterControls()
         {
-            filterColumns.Items.Add(T("All columns"));
-            filterColumns.SelectedIndex = 0;
-
             foreach (string key in OperatorKeys) filterOperators.Items.Add(T(key));
             filterOperators.SelectedIndex = 0;
 
@@ -354,6 +534,188 @@ namespace MSSQLTool.Results
             {
                 if (e.Key == Key.Enter) { ApplyView(); e.Handled = true; }
             };
+
+            UpdateFilterColumnCaption();
+        }
+
+        /// <summary>
+        /// Builds the checkbox drop-down behind the column toggle.  The list is populated lazily on
+        /// first open: a 271-column result set would otherwise create 271 checkboxes the moment the
+        /// panel loads, before the user ever touches the filter.
+        /// </summary>
+        private void BuildFilterColumnPopup()
+        {
+            var panel = new DockPanel { LastChildFill = true, Width = 240 };
+
+            var actions = new WrapPanel { Margin = new Thickness(0, 0, 0, 6) };
+            actions.Children.Add(CreateSmallButton("Select all", () => SetAllFilterColumns(true)));
+            actions.Children.Add(CreateSmallButton("Deselect all", () => SetAllFilterColumns(false)));
+            DockPanel.SetDock(actions, Dock.Top);
+            panel.Children.Add(actions);
+
+            var scroll = new ScrollViewer
+            {
+                MaxHeight = 320,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled
+            };
+            scroll.Content = filterColumnList;
+            panel.Children.Add(scroll);
+
+            filterColumnPopup.Child = new Border
+            {
+                Background = ThemeBrush("ToolThemeBackgroundBrush", SystemColors.WindowBrush),
+                BorderBrush = ThemeBrush("ToolThemeBorderBrush", new SolidColorBrush(Color.FromRgb(0xBF, 0xC7, 0xD1))),
+                BorderThickness = new Thickness(1),
+                Padding = new Thickness(8),
+                Child = panel
+            };
+            filterColumnPopup.PlacementTarget = filterColumnToggle;
+            filterColumnPopup.Opened += (_, __) =>
+            {
+                EnsureFilterColumnList();
+                if (Window.GetWindow(this) is Window host) host.PreviewMouseDown += OnFilterColumnWindowMouseDown;
+            };
+            filterColumnPopup.Closed += (_, __) =>
+            {
+                if (Window.GetWindow(this) is Window host) host.PreviewMouseDown -= OnFilterColumnWindowMouseDown;
+                filterColumnToggle.IsChecked = false;
+            };
+            filterColumnToggle.Checked += (_, __) => filterColumnPopup.IsOpen = true;
+            filterColumnToggle.Unchecked += (_, __) => filterColumnPopup.IsOpen = false;
+        }
+
+        /// <summary>Closes the column drop-down when the click landed outside it and its toggle.</summary>
+        private void OnFilterColumnWindowMouseDown(object sender, MouseButtonEventArgs e)
+        {
+            if (!filterColumnPopup.IsOpen) return;
+
+            DependencyObject source = e.OriginalSource as DependencyObject;
+            if (IsDescendant(source, filterColumnPopup.Child) || IsDescendant(source, filterColumnToggle)) return;
+            filterColumnPopup.IsOpen = false;
+        }
+
+        private static bool IsDescendant(DependencyObject node, DependencyObject ancestor)
+        {
+            if (node == null || ancestor == null) return false;
+
+            for (int depth = 0; node != null && depth < 32; depth++)
+            {
+                if (ReferenceEquals(node, ancestor)) return true;
+                node = node is Visual || node is System.Windows.Media.Media3D.Visual3D
+                    ? VisualTreeHelper.GetParent(node)
+                    : LogicalTreeHelper.GetParent(node);
+            }
+
+            return false;
+        }
+
+        /// <summary>Rebuilds the ticked-column state for a new result set: every column starts ticked.</summary>
+        private void ResetFilterColumns()
+        {
+            filterColumnsSelected.Clear();
+            if (source != null)
+            {
+                for (int ordinal = 0; ordinal < source.Columns.Count; ordinal++)
+                    filterColumnsSelected.Add(ordinal);
+            }
+
+            filterColumnChecks.Clear();
+            filterColumnList.Children.Clear();
+            filterColumnListDirty = true;
+            UpdateFilterColumnCaption();
+        }
+
+        private void EnsureFilterColumnList()
+        {
+            if (!filterColumnListDirty) return;
+            filterColumnListDirty = false;
+
+            suppressFilterColumnChange = true;
+            try
+            {
+                filterColumnList.Children.Clear();
+                filterColumnChecks.Clear();
+                if (source == null) return;
+
+                for (int ordinal = 0; ordinal < source.Columns.Count; ordinal++)
+                {
+                    int index = ordinal;
+                    DataColumn column = source.Columns[ordinal];
+                    var check = new CheckBox
+                    {
+                        Content = GridAnalytics.DisplayName(column),
+                        IsChecked = filterColumnsSelected.Contains(ordinal),
+                        Margin = new Thickness(0, 2, 0, 2),
+                        ToolTip = GridAnalytics.FriendlyTypeName(column)
+                    };
+                    check.Checked += (_, __) => SetFilterColumnSelected(index, true);
+                    check.Unchecked += (_, __) => SetFilterColumnSelected(index, false);
+                    filterColumnChecks[ordinal] = check;
+                    filterColumnList.Children.Add(check);
+                }
+            }
+            finally
+            {
+                suppressFilterColumnChange = false;
+            }
+        }
+
+        private void SetFilterColumnSelected(int ordinal, bool selected)
+        {
+            if (suppressFilterColumnChange) return;
+            if (selected) filterColumnsSelected.Add(ordinal);
+            else filterColumnsSelected.Remove(ordinal);
+            UpdateFilterColumnCaption();
+        }
+
+        private void SetAllFilterColumns(bool selected)
+        {
+            EnsureFilterColumnList();
+            suppressFilterColumnChange = true;
+            try
+            {
+                filterColumnsSelected.Clear();
+                if (source != null)
+                {
+                    for (int ordinal = 0; ordinal < source.Columns.Count; ordinal++)
+                        if (selected) filterColumnsSelected.Add(ordinal);
+                }
+
+                foreach (KeyValuePair<int, CheckBox> pair in filterColumnChecks)
+                    pair.Value.IsChecked = selected;
+            }
+            finally
+            {
+                suppressFilterColumnChange = false;
+            }
+
+            UpdateFilterColumnCaption();
+        }
+
+        private void UpdateFilterColumnCaption()
+        {
+            int total = source == null ? 0 : source.Columns.Count;
+            string text;
+            if (total == 0 || filterColumnsSelected.Count >= total) text = T("All columns");
+            else if (filterColumnsSelected.Count == 0) text = T("No columns selected");
+            else text = LocalizationManager.Format("{0} column(s) selected", filterColumnsSelected.Count);
+
+            filterColumnToggle.Content = text + "  \u25BE";
+        }
+
+        /// <summary>The ordinals to search, in column order.  Empty means no column was ticked.</summary>
+        private List<int> SelectedFilterOrdinals()
+        {
+            var list = new List<int>();
+            if (source == null) return list;
+
+            foreach (int ordinal in filterColumnsSelected.OrderBy(item => item))
+            {
+                if (ordinal >= 0 && ordinal < source.Columns.Count) list.Add(ordinal);
+            }
+
+            return list;
         }
 
         /// <summary>
@@ -565,7 +927,7 @@ namespace MSSQLTool.Results
             frozenColumns = 0;
             lastFoundOrdinal = -1;
             lastColumnNeedle = string.Empty;
-            RebuildColumnFilter();
+            ResetFilterColumns();
             selectionSummary.Text = T("Select cells to see their statistics.");
 
             // Paint the rows first.  The statistics pass used to run before the grid was bound, so a
@@ -703,6 +1065,7 @@ namespace MSSQLTool.Results
 
             dataGrid.UnselectAll();
             HighlightGridColumn(name);
+            SelectFieldRow(insight);
             if (dataGrid.Items.Count == 0) return;
             try { dataGrid.ScrollIntoView(dataGrid.Items[0], column); }
             catch (Exception ex) { MSSQLToolPackage._logger?.Debug(ex, "Could not scroll to the selected column."); }
@@ -711,11 +1074,7 @@ namespace MSSQLTool.Results
         /// <summary>Drops the field-driven column tint, e.g. as soon as the user picks a cell.</summary>
         private void ClearColumnHighlight()
         {
-            if (activeFieldRow != null)
-            {
-                activeFieldRow.Background = Brushes.Transparent;
-                activeFieldRow = null;
-            }
+            ClearActiveFieldRow();
 
             foreach (DataGridColumn column in dataGrid.Columns)
                 column.ClearValue(DataGridColumn.CellStyleProperty);
@@ -742,23 +1101,19 @@ namespace MSSQLTool.Results
             }
         }
 
-        /// <summary>Selecting a cell in the grid highlights the matching statistics row.</summary>
+        /// <summary>
+        /// Selecting a cell in the grid tidies the panel state: the matching statistics row and the
+        /// matching field row become the single active selection, whatever was tinted before.
+        /// </summary>
         private void OnCurrentCellChanged(object sender, EventArgs e)
         {
-            if (updatingStats || analytics == null || displayed == null) return;
+            if (bulkSelecting || updatingStats || analytics == null || displayed == null) return;
             if (dataGrid.SelectedCells.Count != 1 || dataGrid.CurrentCell.Column == null) return;
 
             string name = Convert.ToString(dataGrid.CurrentCell.Column.SortMemberPath);
             if (string.IsNullOrEmpty(name)) return;
 
-            int ordinal = displayed.Columns.Cast<DataColumn>().ToList()
-                .FindIndex(column => string.Equals(column.ColumnName, name, StringComparison.Ordinal));
-            if (ordinal < 0) return;
-
-            GridColumnInsight insight = analytics.Columns.FirstOrDefault(item => item.Ordinal == ordinal + 1);
-            if (insight == null) return;
-
-            SelectStatisticsRow(ordinal + 1);
+            SelectStatisticsRowForColumn(name);
         }
 
         /// <summary>Highlights the statistics row for a column without running the scroll-back handler.</summary>
@@ -766,6 +1121,37 @@ namespace MSSQLTool.Results
         {
             if (analytics == null) return;
             GridColumnInsight insight = analytics.Columns.FirstOrDefault(item => item.Ordinal == ordinal);
+            if (insight != null) SelectStatisticsRow(insight);
+        }
+
+        /// <summary>
+        /// Picks the statistics row by column name.  The analyzer numbers columns from 1 while the
+        /// placeholder rows used before the statistics pass are numbered from 0, so matching on the
+        /// name keeps both sources correct.
+        /// </summary>
+        private void SelectStatisticsRowForColumn(string columnName)
+        {
+            if (displayed == null || string.IsNullOrEmpty(columnName)) return;
+            if (!displayed.Columns.Contains(columnName)) return;
+
+            string display = GridAnalytics.DisplayName(displayed.Columns[columnName]);
+            // Read the rows the statistics grid is actually showing: ShowSingleInsight swaps the
+            // analytics result, but the visible rows keep pointing at the full column list.
+            GridColumnInsight insight = null;
+            foreach (object item in statsGrid.Items)
+            {
+                if (item is GridColumnInsight candidate && string.Equals(candidate.Name, display, StringComparison.Ordinal))
+                {
+                    insight = candidate;
+                    break;
+                }
+            }
+
+            if (insight != null) SelectStatisticsRow(insight);
+        }
+
+        private void SelectStatisticsRow(GridColumnInsight insight)
+        {
             if (insight == null) return;
 
             updatingStats = true;
@@ -791,118 +1177,220 @@ namespace MSSQLTool.Results
             else status.Text = viewNote + "  " + statsNote;
         }
 
-        private void RebuildColumnFilter()
-        {
-            object previous = filterColumns.SelectedItem;
-            filterColumns.Items.Clear();
-            filterColumns.Items.Add(T("All columns"));
-            if (source != null)
-            {
-                foreach (DataColumn column in source.Columns)
-                    filterColumns.Items.Add(GridAnalytics.DisplayName(column));
-            }
-
-            int index = previous == null ? 0 : filterColumns.Items.IndexOf(previous);
-            filterColumns.SelectedIndex = index < 0 ? 0 : index;
-        }
-
+        /// <summary>
+        /// Applies the find value: every ticked column is tested with the chosen operator, and the
+        /// cells that show the value are tinted so Previous/Next can step through them.  Unlike the
+        /// old filter row it never hides rows: the value stays in context.
+        /// </summary>
         private void ApplyView()
         {
             if (source == null) return;
 
-            string needle = (search.Text ?? string.Empty).Trim();
-            int filterColumn = filterColumns.SelectedIndex - 1;
-            string opKey = filterColumn >= 0 && filterOperators.SelectedIndex >= 0
-                ? OperatorKeys[filterOperators.SelectedIndex] : "Contains";
             string operand = (filterValue.Text ?? string.Empty).Trim();
+            string opKey = filterOperators.SelectedIndex >= 0 && filterOperators.SelectedIndex < OperatorKeys.Length
+                ? OperatorKeys[filterOperators.SelectedIndex]
+                : "Contains";
 
-            bool hasColumnFilter = filterColumn >= 0 && filterColumn < source.Columns.Count &&
-                                   (operand.Length > 0 || opKey == "Equals" || opKey == "Not equals");
-
-            var rows = new List<DataRow>();
-            int scanned = 0;
-            try
+            bool finding = operand.Length > 0;
+            List<int> columns = finding ? SelectedFilterOrdinals() : null;
+            if (finding && (columns == null || columns.Count == 0))
             {
-                foreach (DataRow row in source.Rows)
-                {
-                    if (scanned >= ScanCap || rows.Count >= DisplayCap) break;
-                    scanned++;
-
-                    if (needle.Length > 0 && !RowContains(row, needle)) continue;
-                    if (hasColumnFilter && !Matches(row[filterColumn], opKey, operand)) continue;
-                    rows.Add(row);
-                }
-            }
-            catch (Exception ex)
-            {
-                MSSQLToolPackage._logger?.Debug(ex, "Filtering the results grid failed.");
+                status.Text = T("Select at least one column to search.");
                 return;
             }
 
-            bool capped = rows.Count >= DisplayCap;
-            bool direct = needle.Length == 0 && !hasColumnFilter;
-            // Unfiltered view: bind the source table directly. Copying 17k rows cell by cell was a
-            // multi-second freeze on wide result sets and bought nothing here.
-            var filtered = direct ? source : source.Clone();
-            displayed = filtered;
+            matchedCells.Clear();
+            matchHits.Clear();
+            matchHitsCapped = false;
+            int scanned = 0, matchingRows = 0;
+            if (finding)
+            {
+                var hits = new List<int>();
+                try
+                {
+                    foreach (DataRow row in source.Rows)
+                    {
+                        if (scanned >= ScanCap) break;
+                        scanned++;
 
+                        if (!MatchRow(row, columns, opKey, operand, hits)) continue;
+                        matchingRows++;
+                        if (hits.Count == 0) continue;
+
+                        matchedCells[row] = new HashSet<int>(hits);
+                        foreach (int ordinal in hits)
+                        {
+                            if (matchHits.Count >= MatchHitCap) { matchHitsCapped = true; break; }
+                            matchHits.Add(new MatchHit { Row = row, Ordinal = ordinal });
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    MSSQLToolPackage._logger?.Debug(ex, "Searching the results grid failed.");
+                    return;
+                }
+            }
+
+            // Finding never hides rows: the matches are tinted where they are, so the value stays in
+            // context and Previous/Next can walk the grid the user is looking at.
+            displayed = source;
             BuildDataColumns();
 
             var view = new DataView(displayed);
             string sort = BuildSortExpression();
             dataGrid.ItemsSource = view;
+            if (sort.Length > 0) view.Sort = sort;
 
-            if (direct)
+            if (finding)
             {
-                if (sort.Length > 0) view.Sort = sort;
-            }
-            else
-            {
-                // Import in batches so the window paints immediately and stays responsive while a
-                // large result set loads. The sort is applied once every row is in.
-                int batchIndex = 0;
-                Action loadBatch = null;
-                loadBatch = () =>
+                if (matchingRows == 0)
                 {
-                    // First batch is small so the grid paints content almost immediately.
-                    int size = batchIndex == 0 ? 200 : 2000;
-                    int end = Math.Min(rows.Count, batchIndex + size);
-                    for (; batchIndex < end; batchIndex++) filtered.ImportRow(rows[batchIndex]);
-                    if (batchIndex < rows.Count)
-                    {
-                        Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Background, loadBatch);
-                        return;
-                    }
-                    if (sort.Length > 0) view.Sort = sort;
-                };
-                loadBatch();
-            }
-
-            if (needle.Length > 0 || hasColumnFilter)
-            {
-                viewNote = capped
-                    ? LocalizationManager.Format("{0} matching row(s), showing the first {1}.", rows.Count, DisplayCap)
-                    : LocalizationManager.Format("{0} matching row(s).", rows.Count);
-            }
-            else if (capped)
-            {
-                viewNote = LocalizationManager.Format("Showing the first {0} rows.", DisplayCap);
+                    viewNote = LocalizationManager.Format("Nothing matches '{0}'.", operand);
+                }
+                else if (matchHits.Count == 0)
+                {
+                    viewNote = LocalizationManager.Format("{0} matching row(s).", matchingRows);
+                }
+                else
+                {
+                    viewNote = LocalizationManager.Format("{0} matching cell(s) in {1} row(s).",
+                        matchHits.Count, matchingRows);
+                    if (matchHitsCapped)
+                        viewNote += "  " + LocalizationManager.Format("Only the first {0} matching cells are listed for Previous/Next.", MatchHitCap);
+                    if (scanned < source.Rows.Count)
+                        viewNote += "  " + LocalizationManager.Format("Scanned the first {0} row(s).", ScanCap);
+                }
             }
             else
             {
                 viewNote = string.Empty;
             }
 
-            // The numbers describe the whole result set: say so when the rows on screen are filtered.
-            if ((needle.Length > 0 || hasColumnFilter) && analytics != null && analytics.Columns.Count > 0)
-            {
-                viewNote = string.IsNullOrEmpty(viewNote)
-                    ? T("Statistics are for all rows, not only the filtered ones.")
-                    : viewNote + "  " + T("Statistics are for all rows, not only the filtered ones.");
-            }
-
+            ResetMatchNavigation();
             UpdateStatus();
             UpdateSortArrows();
+        }
+
+        /// <summary>
+        /// True when the row matches in at least one of <paramref name="columns"/>, and reports the
+        /// ordinals whose text actually shows the searched value (the cells to tint).
+        /// </summary>
+        internal static bool MatchRow(DataRow row, IList<int> columns, string opKey, string operand, IList<int> hits)
+        {
+            if (row == null || row.Table == null || columns == null) return false;
+
+            bool matched = false;
+            if (hits != null) hits.Clear();
+            for (int index = 0; index < columns.Count; index++)
+            {
+                int ordinal = columns[index];
+                if (ordinal < 0 || ordinal >= row.Table.Columns.Count) continue;
+
+                object value = row[ordinal];
+                if (!Matches(value, opKey, operand)) continue;
+
+                matched = true;
+                if (hits != null && CellContains(value, operand)) hits.Add(ordinal);
+            }
+
+            return matched;
+        }
+
+        /// <summary>The text of a cell holds the searched value, ignoring case.</summary>
+        internal static bool CellContains(object value, string needle)
+        {
+            if (value == null || value == DBNull.Value || string.IsNullOrEmpty(needle)) return false;
+            string text = Convert.ToString(value, CultureInfo.CurrentCulture);
+            return !string.IsNullOrEmpty(text) &&
+                   text.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private void ResetMatchNavigation()
+        {
+            matchIndex = -1;
+            matchCounter.Text = matchHits.Count == 0
+                ? string.Empty
+                : "0 / " + matchHits.Count.ToString(CultureInfo.CurrentCulture);
+
+            if (previousMatchButton != null) previousMatchButton.IsEnabled = matchHits.Count > 0;
+            if (nextMatchButton != null) nextMatchButton.IsEnabled = matchHits.Count > 0;
+        }
+
+        private void GoToPreviousMatch() => GoToMatch(-1);
+
+        private void GoToNextMatch() => GoToMatch(1);
+
+        /// <summary>Steps through the matching cells, wrapping around at either end.</summary>
+        private void GoToMatch(int delta)
+        {
+            if (matchHits.Count == 0)
+            {
+                status.Text = T("No matching cells. Search for a value first.");
+                return;
+            }
+
+            if (matchIndex < 0)
+                matchIndex = delta < 0 ? matchHits.Count - 1 : 0;
+            else
+                matchIndex = (matchIndex + delta + matchHits.Count) % matchHits.Count;
+
+            ShowMatch(matchHits[matchIndex], matchIndex + 1);
+        }
+
+        /// <summary>Selects one matching cell and scrolls it into view.</summary>
+        private void ShowMatch(MatchHit hit, int position)
+        {
+            if (hit == null || displayed == null) return;
+            if (hit.Ordinal < 0 || hit.Ordinal >= displayed.Columns.Count) return;
+
+            DataColumn dataColumn = displayed.Columns[hit.Ordinal];
+            DataGridColumn column = dataGrid.Columns.FirstOrDefault(item =>
+                string.Equals(item.SortMemberPath, dataColumn.ColumnName, StringComparison.Ordinal));
+            if (column == null)
+            {
+                viewNote = LocalizationManager.Format("Column {0} is hidden; tick it in the field list to see it.",
+                    GridAnalytics.DisplayName(dataColumn));
+                UpdateStatus();
+                return;
+            }
+
+            DataRowView rowView = FindRowView(hit.Row);
+            if (rowView == null)
+            {
+                status.Text = T("That row is still loading; try again.");
+                return;
+            }
+
+            try
+            {
+                var cell = new DataGridCellInfo(rowView, column);
+                dataGrid.SelectedCells.Clear();
+                dataGrid.CurrentCell = cell;
+                dataGrid.SelectedCells.Add(cell);
+                dataGrid.ScrollIntoView(rowView, column);
+                dataGrid.Focus();
+            }
+            catch (Exception ex)
+            {
+                MSSQLToolPackage._logger?.Debug(ex, "Could not jump to the matching cell.");
+            }
+
+            matchCounter.Text = string.Format(CultureInfo.CurrentCulture, "{0} / {1}", position, matchHits.Count);
+            status.Text = LocalizationManager.Format("Match {0} of {1}: column {2}.",
+                position, matchHits.Count, GridAnalytics.DisplayName(dataColumn));
+        }
+
+        private DataRowView FindRowView(DataRow row)
+        {
+            if (row == null) return null;
+
+            foreach (object item in dataGrid.Items)
+            {
+                if (item is DataRowView view && ReferenceEquals(view.Row, row)) return view;
+            }
+
+            return null;
         }
 
         private string BuildSortExpression()
@@ -931,8 +1419,8 @@ namespace MSSQLTool.Results
         {
             if (displayed != null)
             {
-                // Filtering and sorting swap the underlying table but keep the same columns. Rebuilding
-                // 271 column objects on every view change was the biggest cost.
+                // Sorting and visibility changes keep the same columns. Rebuilding 271 column
+                // objects on every view change was the biggest cost.
                 string signature = ColumnSignature(displayed);
                 if (signature == columnsSignature && dataGrid.Columns.Count > 0)
                 {
@@ -961,10 +1449,17 @@ namespace MSSQLTool.Results
                 text.SetValue(TextBlock.TextTrimmingProperty, TextTrimming.CharacterEllipsis);
                 text.SetValue(TextBlock.VerticalAlignmentProperty, VerticalAlignment.Center);
                 text.SetValue(TextBlock.PaddingProperty, new Thickness(4, 0, 4, 0));
-                text.SetBinding(TextBlock.TextProperty, new Binding(column.ColumnName) { Converter = CellTextConverter.Instance });
-                text.SetBinding(TextBlock.ToolTipProperty, new Binding(column.ColumnName) { Converter = CellTextConverter.Instance });
-                text.SetBinding(TextBlock.FontStyleProperty, new Binding(column.ColumnName) { Converter = CellTextConverter.Instance, ConverterParameter = "style" });
-                text.SetBinding(TextBlock.ForegroundProperty, new Binding(column.ColumnName) { Converter = CellTextConverter.Instance, ConverterParameter = "brush" });
+                text.SetBinding(TextBlock.TextProperty, new Binding(column.ColumnName) { Converter = cellText });
+                text.SetBinding(TextBlock.ToolTipProperty, new Binding(column.ColumnName) { Converter = cellText });
+                text.SetBinding(TextBlock.FontStyleProperty, new Binding(column.ColumnName) { Converter = cellText, ConverterParameter = "style" });
+                text.SetBinding(TextBlock.ForegroundProperty, new Binding(column.ColumnName) { Converter = cellText, ConverterParameter = "brush" });
+                // Tint the cells whose text is the value the filter found.  The binding source is
+                // the row itself, so the converter only has to look up this column's ordinal.
+                text.SetBinding(TextBlock.BackgroundProperty, new Binding(".")
+                {
+                    Converter = cellMatch,
+                    ConverterParameter = index
+                });
 
                 var gridColumn = new DataGridTemplateColumn
                 {
@@ -1086,15 +1581,15 @@ namespace MSSQLTool.Results
             ApplyView();
         }
 
+        /// <summary>
+        /// A click on a column header selects the column, it does not sort: on a wide result set the
+        /// sort rebound the grid (and dropped the selection) on every stray click.  Sorting stays on
+        /// the header context menu.
+        /// </summary>
         private void OnSorting(object sender, DataGridSortingEventArgs e)
         {
+            // Also suppresses the built-in DataGrid sort, which would rebind the view.
             e.Handled = true;
-            string column = Convert.ToString(e.Column.SortMemberPath);
-            if (string.IsNullOrEmpty(column)) return;
-
-            SortKey key = sorts.FirstOrDefault(item => item.Column == column);
-            bool descending = key == null ? false : !key.Descending;
-            SetSort(column, descending);
         }
 
         private void ShowColumnMenu()
@@ -1223,17 +1718,17 @@ namespace MSSQLTool.Results
 
         private void ClearFilters()
         {
-            applyTimer.Stop();
-            search.Text = string.Empty;
             filterValue.Text = string.Empty;
-            if (filterColumns.Items.Count > 0) filterColumns.SelectedIndex = 0;
             if (filterOperators.Items.Count > 0) filterOperators.SelectedIndex = 0;
+            SetAllFilterColumns(true);
+            filterColumnPopup.IsOpen = false;
+            applyTimer.Stop();
             ApplyView();
         }
 
         /// <summary>
-        /// Typing in a filter box rebuilds the visible rows; waiting for a short pause keeps the
-        /// keystrokes responsive on a wide result set instead of re-cloning rows for every character.
+        /// Typing in the find box rescans the ticked columns; waiting for a short pause keeps the
+        /// keystrokes responsive on a wide result set instead of rescanning for every character.
         /// </summary>
         private void ScheduleApplyView()
         {
@@ -1252,13 +1747,17 @@ namespace MSSQLTool.Results
             }
             else if (e.Key == Key.F && (Keyboard.Modifiers & ModifierKeys.Control) != 0)
             {
-                search.Focus();
-                search.SelectAll();
+                filterValue.Focus();
+                filterValue.SelectAll();
                 e.Handled = true;
             }
             else if (e.Key == Key.F3)
             {
-                FindNextColumn();
+                // F3 walks the found cells when a search is active; otherwise it keeps its old
+                // job of cycling through matching column names.
+                if ((Keyboard.Modifiers & ModifierKeys.Shift) != 0 && matchHits.Count > 0) GoToPreviousMatch();
+                else if (matchHits.Count > 0) GoToNextMatch();
+                else FindNextColumn();
                 e.Handled = true;
             }
             else if (e.Key == Key.Escape)
@@ -1343,14 +1842,23 @@ namespace MSSQLTool.Results
                 decimal sum = 0;
                 decimal? min = null, max = null;
 
+                // A whole-column selection can hold tens of thousands of cells; resolving each
+                // column by name once keeps the summary linear instead of searching per cell.
+                Dictionary<string, DataColumn> columnsByName = null;
+                if (displayed != null)
+                {
+                    columnsByName = new Dictionary<string, DataColumn>(displayed.Columns.Count, StringComparer.Ordinal);
+                    foreach (DataColumn item in displayed.Columns) columnsByName[item.ColumnName] = item;
+                }
+
                 foreach (DataGridCellInfo cell in dataGrid.SelectedCells)
                 {
                     DataRowView view = cell.Item as DataRowView;
                     if (view == null) continue;
 
                     string name = Convert.ToString(cell.Column.SortMemberPath);
-                    DataColumn column = displayed == null ? null : displayed.Columns.Cast<DataColumn>()
-                        .FirstOrDefault(item => item.ColumnName == name);
+                    DataColumn column = null;
+                    if (columnsByName != null && !string.IsNullOrEmpty(name)) columnsByName.TryGetValue(name, out column);
                     if (column == null) continue;
 
                     rows.Add(view);
@@ -1487,22 +1995,51 @@ namespace MSSQLTool.Results
             statsText.Text = FormatInsight(insight);
         }
 
-        private UIElement CreateFieldPanel()
+        private FrameworkElement CreateFieldPanel()
         {
             var panel = new DockPanel { LastChildFill = true };
 
-            var title = new TextBlock
+            var header = new DockPanel { LastChildFill = true, Margin = new Thickness(0, 0, 0, 6) };
+            var collapse = new Button
+            {
+                Content = "\u25C0",
+                Width = 20,
+                Height = 20,
+                Padding = new Thickness(0),
+                FontSize = 9,
+                Background = Brushes.Transparent,
+                BorderThickness = new Thickness(0),
+                Cursor = Cursors.Hand,
+                Focusable = false,
+                ToolTip = LocalizationManager.T("Collapse the field list")
+            };
+            collapse.Click += (_, __) => SetFieldPanelCollapsed(true);
+            DockPanel.SetDock(collapse, Dock.Right);
+            header.Children.Add(collapse);
+            header.Children.Add(new TextBlock
             {
                 Text = LocalizationManager.T("Fields"),
                 FontWeight = FontWeights.SemiBold,
-                Margin = new Thickness(0, 0, 0, 6)
-            };
-            DockPanel.SetDock(title, Dock.Top);
-            panel.Children.Add(title);
+                VerticalAlignment = VerticalAlignment.Center
+            });
+            DockPanel.SetDock(header, Dock.Top);
+            panel.Children.Add(header);
 
             fieldFilter.TextChanged += (_, __) => RebuildFieldList();
             DockPanel.SetDock(fieldFilter, Dock.Top);
             panel.Children.Add(fieldFilter);
+
+            // Bulk visibility: ticking 271 checkboxes one by one was the only way to bring a wide
+            // result set back.  The buttons act on the rows the field filter currently shows.
+            var fieldActions = new WrapPanel { Margin = new Thickness(0, 0, 0, 6) };
+            var selectAllFields = CreateSmallButton("Select all", () => SetAllFieldsVisible(true));
+            selectAllFields.ToolTip = LocalizationManager.T("Show every field in the list.");
+            var deselectAllFields = CreateSmallButton("Deselect all", () => SetAllFieldsVisible(false));
+            deselectAllFields.ToolTip = LocalizationManager.T("Hide every field in the list.");
+            fieldActions.Children.Add(selectAllFields);
+            fieldActions.Children.Add(deselectAllFields);
+            DockPanel.SetDock(fieldActions, Dock.Top);
+            panel.Children.Add(fieldActions);
 
             var scroll = new ScrollViewer
             {
@@ -1515,6 +2052,131 @@ namespace MSSQLTool.Results
             return panel;
         }
 
+        /// <summary>Drag handle between the field list and the results area.</summary>
+        private GridSplitter CreateFieldSplitter()
+        {
+            var style = new Style(typeof(GridSplitter));
+            style.Setters.Add(new Setter(Control.BackgroundProperty, new SolidColorBrush(Color.FromArgb(18, 0, 0, 0))));
+            style.Setters.Add(new Setter(Control.BorderThicknessProperty, new Thickness(0)));
+            var hover = new Trigger { Property = UIElement.IsMouseOverProperty, Value = true };
+            hover.Setters.Add(new Setter(Control.BackgroundProperty, new SolidColorBrush(Color.FromRgb(198, 215, 236))));
+            style.Triggers.Add(hover);
+
+            var splitter = new GridSplitter
+            {
+                Width = 6,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Stretch,
+                ResizeDirection = GridResizeDirection.Columns,
+                ResizeBehavior = GridResizeBehavior.PreviousAndNext,
+                Cursor = Cursors.SizeWE,
+                Style = style,
+                ToolTip = LocalizationManager.T("Drag to resize the field list")
+            };
+            splitter.DragCompleted += (_, __) => RememberFieldWidth();
+            return splitter;
+        }
+
+        /// <summary>
+        /// The narrow strip left behind when the field list is collapsed.  Clicking it brings the
+        /// list back, so collapsing never strands the user without a way to restore the panel.
+        /// </summary>
+        private FrameworkElement CreateCollapsedFieldStrip()
+        {
+            var content = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
+            content.Children.Add(new TextBlock
+            {
+                Text = "\u25B6",
+                FontSize = 8,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                Opacity = 0.7,
+                Margin = new Thickness(0, 0, 0, 8)
+            });
+            content.Children.Add(new TextBlock
+            {
+                Text = LocalizationManager.T("Fields"),
+                LayoutTransform = new RotateTransform(90),
+                HorizontalAlignment = HorizontalAlignment.Center,
+                FontSize = 11,
+                Opacity = 0.75
+            });
+
+            var strip = new Border
+            {
+                Background = new SolidColorBrush(Color.FromArgb(14, 0, 0, 0)),
+                CornerRadius = new CornerRadius(3),
+                Cursor = Cursors.Hand,
+                ToolTip = LocalizationManager.T("Expand the field list"),
+                Child = content
+            };
+            strip.MouseLeftButtonUp += (_, __) => SetFieldPanelCollapsed(false);
+            return strip;
+        }
+
+        /// <summary>
+        /// Shows or hides every field the field filter currently lists.  One ApplyView call covers
+        /// the whole batch: 271 individual visibility changes would rebuild the grid 271 times.
+        /// </summary>
+        private void SetAllFieldsVisible(bool visible)
+        {
+            if (allFields == null || allFields.Count == 0) return;
+
+            string needle = (fieldFilter.Text ?? string.Empty).Trim();
+            var affected = new List<int>();
+            foreach (GridColumnInsight field in allFields)
+            {
+                if (needle.Length > 0 && !MatchesField(field, needle)) continue;
+                affected.Add(field.Ordinal);
+            }
+
+            if (affected.Count == 0) return;
+
+            string message;
+            if (visible)
+            {
+                foreach (int ordinal in affected) hiddenOrdinals.Remove(ordinal);
+                message = LocalizationManager.Format("Showing {0} field(s).", affected.Count);
+            }
+            else
+            {
+                foreach (int ordinal in affected)
+                    if (!hiddenOrdinals.Contains(ordinal)) hiddenOrdinals.Add(ordinal);
+                message = LocalizationManager.Format("Hiding {0} field(s).", affected.Count);
+            }
+
+            ApplyView();
+            RebuildFieldList();
+            status.Text = message;
+        }
+
+        private void SetFieldPanelCollapsed(bool collapsed)
+        {
+            if (fieldPanel == null || fieldPanelCollapsed == collapsed) return;
+            if (collapsed) RememberFieldWidth();
+            fieldPanelCollapsed = collapsed;
+            ApplyFieldPanelState();
+        }
+
+        /// <summary>Keeps the expanded width across a collapse/expand round trip.</summary>
+        private void RememberFieldWidth()
+        {
+            if (fieldColumn == null || !fieldColumn.Width.IsAbsolute) return;
+            double width = fieldColumn.Width.Value;
+            if (width >= MinimumFieldWidth) expandedFieldWidth = width;
+        }
+
+        private void ApplyFieldPanelState()
+        {
+            if (fieldPanel == null || collapsedFieldStrip == null || fieldColumn == null) return;
+
+            bool collapsed = fieldPanelCollapsed;
+            fieldPanel.Visibility = collapsed ? Visibility.Collapsed : Visibility.Visible;
+            collapsedFieldStrip.Visibility = collapsed ? Visibility.Visible : Visibility.Collapsed;
+            fieldSplitter.Visibility = collapsed ? Visibility.Collapsed : Visibility.Visible;
+            fieldColumn.MinWidth = collapsed ? 0 : MinimumFieldWidth;
+            fieldColumn.Width = new GridLength(collapsed ? CollapsedFieldWidth : expandedFieldWidth);
+        }
+
         /// <summary>
         /// One row per column: the checkbox drives its visibility in the grid, the name jumps to it.
         /// Rebuilt when the column set or the filter changes, never on every grid keystroke.
@@ -1524,6 +2186,8 @@ namespace MSSQLTool.Results
             fieldGeneration++;
             fieldQueue = null;
             fieldList.Children.Clear();
+            fieldRows.Clear();
+            activeFieldRow = null;
             List<GridColumnInsight> fields = allFields;
             if (fields == null) return;
 
@@ -1619,6 +2283,7 @@ namespace MSSQLTool.Results
                 FocusGridColumn(column);
                 SelectFieldRow(host);
             };
+            fieldRows[ordinal] = host;
             return host;
         }
 
@@ -1629,6 +2294,223 @@ namespace MSSQLTool.Results
                 activeFieldRow.Background = Brushes.Transparent;
             activeFieldRow = row;
             row.Background = FieldActiveBrush;
+        }
+
+        private void ClearActiveFieldRow()
+        {
+            if (activeFieldRow == null) return;
+            activeFieldRow.Background = Brushes.Transparent;
+            activeFieldRow = null;
+        }
+
+        /// <summary>Marks the field row of a column, if that row has been built yet.</summary>
+        private void SelectFieldRow(GridColumnInsight insight)
+        {
+            if (insight != null && fieldRows.TryGetValue(insight.Ordinal, out Border row))
+            {
+                SelectFieldRow(row);
+                return;
+            }
+
+            ClearActiveFieldRow();
+        }
+
+        private GridColumnInsight FieldForColumn(string columnName)
+        {
+            if (allFields == null || displayed == null || string.IsNullOrEmpty(columnName)) return null;
+            if (!displayed.Columns.Contains(columnName)) return null;
+
+            int index = displayed.Columns.IndexOf(columnName);
+            return allFields.FirstOrDefault(item => item.Ordinal == index);
+        }
+
+        /// <summary>Marks the field list on a column clicked in the grid.</summary>
+        private void SelectFieldRowForColumn(string columnName)
+            => SelectFieldRow(FieldForColumn(columnName));
+
+        /// <summary>
+        /// Keeps the field list on the column holding the caret.  Called after a cell selection
+        /// change, which clears the previous tint, so exactly one row is ever highlighted.
+        /// </summary>
+        private void SyncFieldRowFromGrid()
+        {
+            DataGridColumn column = dataGrid.CurrentCell.Column;
+            string name = column == null ? null : Convert.ToString(column.SortMemberPath);
+            if (string.IsNullOrEmpty(name))
+            {
+                ClearActiveFieldRow();
+                return;
+            }
+
+            SelectFieldRowForColumn(name);
+        }
+
+        /// <summary>
+        /// A click on a column header selects every cell of that column and points the field list and
+        /// the statistics grid at the same column.
+        /// </summary>
+        private void OnGridPreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+        {
+            try
+            {
+                // Resizing a column also ends with a mouse-up over its header; that is not a click
+                // on the column and must not touch the selection.
+                if (IsInsideHeaderGripper(e.OriginalSource as DependencyObject)) return;
+
+                DataGridColumnHeader header = FindColumnHeader(e.OriginalSource as DependencyObject);
+                DataGridColumn column = header == null ? null : header.Column;
+                string name = column == null ? null : Convert.ToString(column.SortMemberPath);
+                if (string.IsNullOrEmpty(name)) return;
+
+                // The header click no longer sorts, so nothing rebinds the view between the click
+                // and this selection; select straight away instead of waiting for a dispatcher pass.
+                SelectWholeColumn(name);
+            }
+            catch (Exception ex)
+            {
+                MSSQLToolPackage._logger?.Debug(ex, "Could not select the clicked column.");
+            }
+        }
+
+        /// <summary>
+        /// Selects every cell of one column.  Each cell is added individually, which costs roughly
+        /// 70 ms per 1000 cells, so a very tall grid stops at <see cref="ColumnSelectionCap"/> and the
+        /// status line says how many cells were left out instead of freezing the window.
+        /// </summary>
+        private void SelectWholeColumn(string columnName)
+        {
+            if (displayed == null || string.IsNullOrEmpty(columnName)) return;
+
+            DataGridColumn column = dataGrid.Columns.FirstOrDefault(item =>
+                string.Equals(item.SortMemberPath, columnName, StringComparison.Ordinal));
+            if (column == null)
+            {
+                viewNote = LocalizationManager.Format("Column {0} is hidden; tick it in the field list to see it.",
+                    GridAnalytics.DisplayName(displayed.Columns[columnName]));
+                UpdateStatus();
+                return;
+            }
+
+            ScrollViewer scroll = FindScrollViewer(dataGrid);
+            double horizontal = scroll == null ? 0 : scroll.HorizontalOffset;
+            double vertical = scroll == null ? 0 : scroll.VerticalOffset;
+
+            int total = dataGrid.Items.Count;
+            if (total == 0)
+            {
+                // Nothing to select yet: still point the other panels at the column.
+                ClearColumnHighlight();
+                SelectFieldRowForColumn(columnName);
+                SelectStatisticsRowForColumn(columnName);
+                return;
+            }
+
+            int count = Math.Min(total, ColumnSelectionCap);
+
+            ClearColumnHighlight();
+            bulkSelecting = true;
+            try
+            {
+                dataGrid.SelectedCells.Clear();
+                for (int index = 0; index < count; index++)
+                    dataGrid.SelectedCells.Add(new DataGridCellInfo(dataGrid.Items[index], column));
+            }
+            catch (Exception ex)
+            {
+                MSSQLToolPackage._logger?.Debug(ex, "Could not select every cell of the column.");
+            }
+            finally
+            {
+                bulkSelecting = false;
+            }
+
+            // Adding cells can push the viewport; put it back where the user was.
+            if (scroll != null)
+            {
+                scroll.ScrollToHorizontalOffset(horizontal);
+                scroll.ScrollToVerticalOffset(vertical);
+            }
+
+            UpdateSelectionStatistics();
+            SelectFieldRowForColumn(columnName);
+            SelectStatisticsRowForColumn(columnName);
+
+            string display = GridAnalytics.DisplayName(displayed.Columns[columnName]);
+            status.Text = count < total
+                ? LocalizationManager.Format("Selected the first {0} of {1} cells in column {2}.", count, total, display)
+                : LocalizationManager.Format("Selected all {0} cells of column {1}.", total, display);
+        }
+
+        private static ScrollViewer FindScrollViewer(DependencyObject node)
+        {
+            if (node == null) return null;
+            var queue = new Queue<DependencyObject>();
+            queue.Enqueue(node);
+            while (queue.Count > 0)
+            {
+                DependencyObject current = queue.Dequeue();
+                if (current is ScrollViewer viewer) return viewer;
+
+                int children = VisualTreeHelper.GetChildrenCount(current);
+                for (int index = 0; index < children; index++)
+                    queue.Enqueue(VisualTreeHelper.GetChild(current, index));
+            }
+
+            return null;
+        }
+
+        private static DataGridColumnHeader FindColumnHeader(DependencyObject node)
+        {
+            for (int depth = 0; node != null && depth < 12; depth++)
+            {
+                if (node is DataGridColumnHeader header) return header;
+                node = node is Visual || node is System.Windows.Media.Media3D.Visual3D
+                    ? VisualTreeHelper.GetParent(node)
+                    : LogicalTreeHelper.GetParent(node);
+            }
+
+            return null;
+        }
+
+        private static bool IsInsideHeaderGripper(DependencyObject node)
+        {
+            for (int depth = 0; node != null && depth < 8; depth++)
+            {
+                if (node is Thumb thumb && thumb.Name != null &&
+                    thumb.Name.EndsWith("HeaderGripper", StringComparison.Ordinal))
+                {
+                    return true;
+                }
+
+                node = node is Visual || node is System.Windows.Media.Media3D.Visual3D
+                    ? VisualTreeHelper.GetParent(node)
+                    : LogicalTreeHelper.GetParent(node);
+            }
+
+            return false;
+        }
+
+        /// <summary>Switches between the "NULL" marker and a blank cell without rebuilding columns.</summary>
+        private void OnShowNullChanged()
+        {
+            bool visible = showNull.IsChecked == true;
+            if (cellText.ShowNull == visible) return;
+
+            cellText.ShowNull = visible;
+            try
+            {
+                // The binding reads ShowNull on every evaluation, so re-realising the rows applies
+                // the new text to the visible cells without touching column widths or the freeze.
+                dataGrid.Items.Refresh();
+            }
+            catch (Exception ex)
+            {
+                MSSQLToolPackage._logger?.Debug(ex, "Could not refresh the cells after switching NULL display.");
+            }
+
+            status.Text = visible
+                ? T("Empty cells show NULL.")
+                : T("Empty cells are left blank.");
         }
 
         private static bool IsInsideCheckBox(DependencyObject node)
@@ -1698,6 +2580,81 @@ namespace MSSQLTool.Results
             if (analytics == null) return;
             Clipboard.SetText(GridAnalytics.ToText(analytics));
             status.Text = T("Statistics copied to the clipboard.");
+        }
+
+        /// <summary>
+        /// Resizes every visible column to its content: the header and a sample of the rows are
+        /// measured with the grid's own font, then clamped between 64 and 320 px so one long
+        /// varchar or XML blob cannot push every other column off the screen.
+        /// </summary>
+        private void AutoFitColumns()
+        {
+            if (displayed == null || dataGrid.Columns.Count == 0)
+            {
+                status.Text = T("Run a query first; there is no result set to fit.");
+                return;
+            }
+
+            double pixelsPerDip = VisualTreeHelper.GetDpi(this).PixelsPerDip;
+            var typeface = new Typeface(dataGrid.FontFamily, dataGrid.FontStyle, dataGrid.FontWeight, dataGrid.FontStretch);
+            var headerTypeface = new Typeface(dataGrid.FontFamily, dataGrid.FontStyle, FontWeights.SemiBold, dataGrid.FontStretch);
+            double fontSize = dataGrid.FontSize > 0 ? dataGrid.FontSize : 12;
+            int sampleRows = Math.Min(AutoFitSampleRows, displayed.Rows.Count);
+
+            foreach (DataGridColumn gridColumn in dataGrid.Columns)
+            {
+                string name = Convert.ToString(gridColumn.SortMemberPath);
+                if (string.IsNullOrEmpty(name) || !displayed.Columns.Contains(name)) continue;
+
+                DataColumn column = displayed.Columns[name];
+                string widest = string.Empty;
+                for (int row = 0; row < sampleRows; row++)
+                {
+                    object value = displayed.Rows[row][column];
+                    if (value == null || value == DBNull.Value) continue;
+
+                    string text = ReadableCellText(Convert.ToString(value, CultureInfo.CurrentCulture));
+                    if (text.Length > widest.Length) widest = text;
+                }
+
+                double width = MeasureText(widest, typeface, fontSize, pixelsPerDip);
+                double header = MeasureText(GridAnalytics.DisplayName(column), headerTypeface, fontSize, pixelsPerDip);
+                width = Math.Max(width, header) + 22; // cell padding plus the grid lines
+
+                gridColumn.Width = new DataGridLength(Math.Round(
+                    Math.Max(MinimumAutoFitWidth, Math.Min(MaximumAutoFitWidth, width))));
+            }
+
+            status.Text = LocalizationManager.Format(
+                "Column widths fitted to the content ({0}-{1} px).",
+                MinimumAutoFitWidth.ToString("0", CultureInfo.CurrentCulture),
+                MaximumAutoFitWidth.ToString("0", CultureInfo.CurrentCulture));
+        }
+
+        /// <summary>The cell text as one measurable line, bounded so a huge value stays cheap.</summary>
+        private static string ReadableCellText(string value)
+        {
+            if (string.IsNullOrEmpty(value)) return string.Empty;
+
+            string text = value.Replace('\r', ' ').Replace('\n', ' ').Replace('\t', ' ');
+            return text.Length <= 200 ? text : text.Substring(0, 200);
+        }
+
+        private static double MeasureText(string text, Typeface typeface, double fontSize, double pixelsPerDip)
+        {
+            if (string.IsNullOrEmpty(text)) return 0;
+
+            try
+            {
+                var formatted = new FormattedText(text, CultureInfo.CurrentCulture, FlowDirection.LeftToRight,
+                    typeface, fontSize, Brushes.Black, pixelsPerDip);
+                return formatted.WidthIncludingTrailingWhitespace;
+            }
+            catch (Exception)
+            {
+                // Fall back to a character-count estimate rather than failing the whole action.
+                return text.Length * fontSize * 0.62;
+            }
         }
 
         private void ExportCsv()
@@ -1848,23 +2805,6 @@ namespace MSSQLTool.Results
             return "\"" + text.Replace("\"", "\"\"") + "\"";
         }
 
-        private static bool RowContains(DataRow row, string needle)
-        {
-            // Index the row instead of row.ItemArray: the array copy is one allocation per row and
-            // the search runs over the whole result set.
-            int count = row.Table == null ? 0 : row.Table.Columns.Count;
-            for (int index = 0; index < count; index++)
-            {
-                object value = row[index];
-                if (value == null || value == DBNull.Value) continue;
-                string text = Convert.ToString(value, CultureInfo.CurrentCulture);
-                if (!string.IsNullOrEmpty(text) && text.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0)
-                    return true;
-            }
-
-            return false;
-        }
-
         private static bool Matches(object value, string opKey, string operand)
         {
             string text = value == null || value == DBNull.Value
@@ -1961,20 +2901,63 @@ namespace MSSQLTool.Results
             public bool Descending;
         }
 
+        /// <summary>One matching cell, kept in display order for Previous/Next navigation.</summary>
+        private sealed class MatchHit
+        {
+            public DataRow Row;
+            public int Ordinal;
+        }
+
+        private static readonly Brush MatchCellBrush = new SolidColorBrush(Color.FromArgb(150, 255, 214, 0));
+
+        /// <summary>
+        /// The tint behind a cell whose value the filter found.  The binding source is the row
+        /// (DataContext), so each cell only asks whether its own column ordinal is in the matched
+        /// set; only the cells the grid actually realises ever evaluate it.
+        /// </summary>
+        private Brush MatchCellBackground(object item, object parameter)
+        {
+            if (matchedCells.Count == 0) return Brushes.Transparent;
+
+            DataRowView rowView = item as DataRowView;
+            if (rowView == null) return Brushes.Transparent;
+            if (!int.TryParse(Convert.ToString(parameter, CultureInfo.InvariantCulture), out int ordinal))
+                return Brushes.Transparent;
+
+            return matchedCells.TryGetValue(rowView.Row, out HashSet<int> ordinals) && ordinals.Contains(ordinal)
+                ? MatchCellBrush
+                : Brushes.Transparent;
+        }
+
+        private sealed class CellMatchConverter : IValueConverter
+        {
+            private readonly GridAnalyticsControl owner;
+
+            public CellMatchConverter(GridAnalyticsControl owner) => this.owner = owner;
+
+            public object Convert(object value, Type targetType, object parameter, CultureInfo culture)
+                => owner.MatchCellBackground(value, parameter);
+
+            public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
+                => Binding.DoNothing;
+        }
+
         /// <summary>Formats a cell: real text, NULL in italic grey, and the tooltip of the full value.</summary>
         private sealed class CellTextConverter : IValueConverter
         {
-            internal static readonly CellTextConverter Instance = new CellTextConverter();
+            /// <summary>When false, a NULL cell renders blank instead of the "NULL" marker.</summary>
+            public bool ShowNull { get; set; } = true;
 
             public object Convert(object value, Type targetType, object parameter, CultureInfo culture)
             {
-                if (parameter == null || System.Convert.ToString(parameter) == "text")
+                bool isNull = value == null || value == DBNull.Value;
+                string mode = parameter == null ? "text" : System.Convert.ToString(parameter);
+                if (mode == "text")
                 {
-                    return value == null || value == DBNull.Value ? "NULL" : System.Convert.ToString(value, culture);
+                    if (!isNull) return System.Convert.ToString(value, culture);
+                    return ShowNull ? "NULL" : string.Empty;
                 }
 
-                bool isNull = value == null || value == DBNull.Value;
-                string mode = System.Convert.ToString(parameter);
                 if (mode == "style") return isNull ? FontStyles.Italic : FontStyles.Normal;
                 if (mode == "brush") return isNull ? Brushes.Gray : SystemColors.ControlTextBrush;
                 return null;

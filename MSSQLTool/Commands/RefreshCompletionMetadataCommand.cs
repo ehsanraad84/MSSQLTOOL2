@@ -65,20 +65,19 @@ namespace MSSQLTool
                     return;
                 }
 
-                Completion.SqlMetadataCache.Invalidate(connection);
+                Completion.MetadataSnapshot previous = null;
+                Completion.SqlMetadataCache.TryGetCached(connection, out previous);
 
-                // Reload eagerly: GetAsync shows the "Loading SQL completion
-                // metadata..." status animation itself and completes only when
-                // the new snapshot is ready, so the follow-up status text is a
-                // real result, not a promise.
+                // RefreshAsync reloads and returns the newest snapshot; when the reload fails the
+                // previous snapshot stays in use instead of leaving the popup empty.
                 Task reload = Task.Run(async () =>
                 {
                     try
                     {
                         Completion.MetadataSnapshot snapshot =
-                            await Completion.SqlMetadataCache.GetAsync(connection, CancellationToken.None).ConfigureAwait(false);
+                            await Completion.SqlMetadataCache.RefreshAsync(connection, CancellationToken.None).ConfigureAwait(false);
                         await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync(package.DisposalToken);
-                        ReportResult(snapshot);
+                        ReportResult(snapshot, previous);
                     }
                     catch (Exception ex)
                     {
@@ -97,7 +96,7 @@ namespace MSSQLTool
             }
         }
 
-        private void ReportResult(Completion.MetadataSnapshot snapshot)
+        private void ReportResult(Completion.MetadataSnapshot snapshot, Completion.MetadataSnapshot previous)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
             if (snapshot == null)
@@ -109,6 +108,13 @@ namespace MSSQLTool
             if (!string.IsNullOrWhiteSpace(snapshot.ErrorMessage))
             {
                 ShowStatus(LocalizationManager.Format("SQL completion metadata refresh failed: {0}", snapshot.ErrorMessage));
+                return;
+            }
+
+            // A failure that kept the old snapshot must not look like a successful refresh.
+            if (previous != null && ReferenceEquals(previous, snapshot) && snapshot.IsStale)
+            {
+                ShowStatus(LocalizationManager.T("SQL completion metadata refresh did not complete; the previous snapshot is still in use."));
                 return;
             }
 

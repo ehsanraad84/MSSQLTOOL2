@@ -113,16 +113,22 @@ namespace MSSQLTool
         private static CancellationTokenSource _statisticsCaptureCancellationTokenSource;
         private System.Windows.Threading.DispatcherTimer _connectionColorRetryTimer;
         private System.Windows.Threading.DispatcherTimer _activeConnectionMonitorTimer;
+        private System.Windows.Threading.DispatcherTimer _completionValidationTimer;
         private EnvDTE.WindowEvents _windowEvents;
         private int _connectionColorRetryCount;
         private string _lastObservedConnectionColorKey;
         private string _lastObservedConnectionWindowKey;
-        public static Logger _logger;
+        internal static ModuleLogger _logger;
 
         private void InitializeLogging()
         {
             LoggingSetup.Apply(AppPaths.LogsFolder);
             _logger = LogManager.GetCurrentClassLogger();
+
+            // The Diagnostics page can silence a module; applying the mask here means a restart
+            // honours the switches before the first module writes anything.
+            try { ModuleLogSettings.Apply(SettingsManager.GetLoggingSettings()); }
+            catch (Exception ex) { _logger?.Debug(ex, "Could not apply the module log switches."); }
         }
 
         /// <summary>
@@ -431,6 +437,12 @@ namespace MSSQLTool
                 try { QueryTextCaptureService.Initialize(this, application); }
                 catch (Exception captureError) { _logger?.Error(captureError, "Query text capture could not start."); }
 
+                // The active-window monitor was written but never started, so the metadata prefetch
+                // it performs was dead code. Starting it here makes connection changes warm the cache;
+                // the interval is unchanged.
+                StartActiveWindowConnectionMonitor();
+                StartCompletionValidationMonitor();
+
                 // "File.ConnectObjectExplorer"
                 // "Query.Connect"
                 // 
@@ -531,6 +543,8 @@ namespace MSSQLTool
                 _registeredTextViews.Clear();
                 _activeConnectionMonitorTimer?.Stop();
                 _connectionColorRetryTimer?.Stop();
+                _completionValidationTimer?.Stop();
+                Completion.SqlMetadataCache.Shutdown();
                 if (_windowEvents != null)
                 {
                     _windowEvents.WindowActivated -= WindowActivated_Event;
@@ -609,6 +623,55 @@ namespace MSSQLTool
             _activeConnectionMonitorTimer.Start();
         }
 
+        /// <summary>
+        /// Cheap periodic freshness check. Comparing a catalog signature is a few milliseconds once
+        /// per interval; it replaces the old "throw the snapshot away every 30 minutes" rule and also
+        /// covers schema changes made outside this window (another tab, another tool, a deployment).
+        /// </summary>
+        private void StartCompletionValidationMonitor()
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            if (_completionValidationTimer != null) return;
+
+            _completionValidationTimer = new System.Windows.Threading.DispatcherTimer
+            {
+                Interval = TimeSpan.FromMinutes(1)
+            };
+            _completionValidationTimer.Tick += (sender, args) =>
+            {
+                try
+                {
+                    if (!SettingsManager.GetSqlCompletionSettings().enabled) return;
+                    Completion.SqlMetadataCache.ValidateIfDue(ScriptFactoryAccess.GetCurrentConnectionInfo());
+                }
+                catch (Exception ex)
+                {
+                    _logger?.Debug(ex, "SQL completion metadata validation was skipped.");
+                }
+            };
+            _completionValidationTimer.Start();
+        }
+
+        /// <summary>
+        /// Warms the completion cache for the active window. Called when a query window opens or
+        /// becomes active, so the first keystroke does not pay the catalog load. Idempotent, and
+        /// honours the "warm metadata" setting.
+        /// </summary>
+        internal void WarmCompletionMetadata()
+        {
+            try
+            {
+                if (!SettingsManager.GetSqlCompletionSettings().prefetchMetadata) return;
+                ScriptFactoryAccess.ConnectionInfo info = ScriptFactoryAccess.GetCurrentConnectionInfo();
+                if (info == null || string.IsNullOrWhiteSpace(info.FullConnectionString)) return;
+                _ = Completion.SqlMetadataCache.WarmConnectionAsync(info);
+            }
+            catch (Exception ex)
+            {
+                _logger?.Debug(ex, "Could not warm the SQL completion metadata cache.");
+            }
+        }
+
         private ScriptFactoryAccess.ConnectionInfo _monitorConnectionInfo;
         private DateTime _monitorConnectionFetchedUtc;
         private string _monitorConnectionWindowKey;
@@ -669,7 +732,9 @@ namespace MSSQLTool
 
             // Warm the completion metadata cache for this connection so the
             // first IntelliSense request does not pay the schema-load latency.
-            _ = Completion.SqlMetadataCache.PrefetchAsync(connectionInfo);
+            // A connected query window is the one place the snapshot is loaded even when the user
+            // has not typed yet; every later refresh merges object by object.
+            _ = Completion.SqlMetadataCache.WarmConnectionAsync(connectionInfo);
 
             _lastObservedConnectionColorKey = connectionKey;
             _lastObservedConnectionWindowKey = windowKey;
@@ -799,6 +864,7 @@ namespace MSSQLTool
                         if (!existing.IsFor(textView)) existing.DismissCompletion();
                     }
                     EnsureCommandFilter(textView);
+                    WarmCompletionMetadata();
                 }
             }
             catch (Exception ex)
@@ -970,9 +1036,14 @@ namespace MSSQLTool
             {
                 var executedTextSpan = GridAccess.GetNonPublicField(QEOLESQLExec, "textSpan");
                 string executedSql = (string)GridAccess.GetProperty(executedTextSpan, "Text");
-                if (SettingsManager.GetSqlCompletionSettings().autoRefreshMetadata
-                    && Completion.SqlMetadataCache.ShouldInvalidateAfterExecution(executedSql))
-                    Completion.SqlMetadataCache.Invalidate(ScriptFactoryAccess.GetCurrentConnectionInfo());
+                if (SettingsManager.GetSqlCompletionSettings().autoRefreshMetadata)
+                {
+                    // Attribute the DDL to concrete objects and refresh those. The old code threw the
+                    // whole snapshot away, so the next popup waited for a full database reload.
+                    Completion.SchemaChangeSet change = Completion.SchemaChangeAnalyzer.Analyze(executedSql);
+                    if (change.HasChanges)
+                        Completion.SqlMetadataCache.ApplySchemaChange(ScriptFactoryAccess.GetCurrentConnectionInfo(), change);
+                }
             }
             catch (Exception ex)
             {
